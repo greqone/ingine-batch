@@ -178,7 +178,8 @@ struct Partial {  // a CTA's candidates of a step: max logit, sum of exp(logit -
 };
 
 __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(LOOP_THREADS, 1)
-    markov_loop_kernel(DraftSeqs S, LoopArgs A, float T, std::uint64_t seed, std::int32_t* tokens, float* conf) {
+    markov_loop_kernel(int gamma, DraftSeqs S, LoopArgs A, float T, std::uint64_t seed, std::int32_t* tokens,
+                       float* conf) {
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   __shared__ __align__(16) __nv_bfloat16 z[2 * RANK];  // [state_i, W1[prev]]
@@ -195,9 +196,9 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(LOOP_THREADS, 1)
   if (tid == 0) sh_prev = S.anchor[b];
   const bool owner = lane < CANDS_PER_WARP;
   const int k = rank * HALF_CANDS + warp * CANDS_PER_WARP + lane;  // owners' candidate
-  for (int i = 0; i < GAMMA; ++i) {
+  for (int i = 0; i < gamma; ++i) {
     // this step's inputs that do not depend on the previous pick, in flight across the barriers
-    const size_t row0 = (size_t(b) * GAMMA + i) * CANDIDATES;
+    const size_t row0 = (size_t(b) * gamma + i) * CANDIDATES;
     const int my_c = owner ? A.cand_idx[row0 + k] : 0;
     const float my_val = owner ? A.cand_val[row0 + k] : 0.f;
     const float my_fb = bf(A.fold_b[my_c]);
@@ -206,7 +207,7 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(LOOP_THREADS, 1)
 #pragma unroll
       for (int g = 0; g < 3; ++g) {
         const int row = g * RANK + tid;
-        part[g] = A.part_h[(size_t(b) * GAMMA + i) * RNN_OUT + row] + A.part_f[size_t(b) * RNN_OUT + row];
+        part[g] = A.part_h[(size_t(b) * gamma + i) * RNN_OUT + row] + A.part_f[size_t(b) * RNN_OUT + row];
         bias[g] = bf(A.rnn_b[row]);
       }
     }
@@ -323,14 +324,15 @@ void topk_candidates(const __nv_bfloat16* base, int rows, int S, int ld, float* 
   check_launch();
 }
 
-void markov_draft(int n, const DraftSeqs& seqs, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b,
+void markov_draft(int n, int gamma, const DraftSeqs& seqs, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b,
                   const __nv_bfloat16* w1, const float* part_h, const float* part_f, const float* cand_val,
                   const std::int32_t* cand_idx, const std::int32_t* map, const __nv_bfloat16* fold_w,
                   const __nv_bfloat16* fold_b, float temperature, std::uint64_t seed, std::int32_t* tokens, float* conf,
                   cudaStream_t stream) {
   if (n <= 0) return;
+  if (gamma < 1 || gamma > GAMMA) throw std::invalid_argument("bdraft::markov_draft: gamma must be in 1..7");
   const LoopArgs A{rnn_w, rnn_b, w1, fold_w, fold_b, part_h, part_f, cand_val, cand_idx, map};
-  markov_loop_kernel<<<2 * n, LOOP_THREADS, 0, stream>>>(seqs, A, temperature, seed, tokens, conf);
+  markov_loop_kernel<<<2 * n, LOOP_THREADS, 0, stream>>>(gamma, seqs, A, temperature, seed, tokens, conf);
   check_launch();
 }
 

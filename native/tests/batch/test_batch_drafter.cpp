@@ -3,7 +3,8 @@
 // the 1024-position local window) in non-adjacent slots, committed in one call, then 1..8 more rows each in one
 // call; every draft of every sequence compared with the Drafter's on the same context. At DRAFTER precision the
 // drafts agree but for near ties (different accumulation orders); at MXFP8 most do. Also: drafts are
-// deterministic, sampled drafts reproduce per seed, and a reset slot drafts as an unused one.
+// deterministic, sampled drafts reproduce per seed, a reset slot drafts as an unused one, and shorter blocks
+// (gamma < 7 drafts) are well formed, deterministic and write only their columns.
 #include "common/test_util.h"
 #include "model/batch_drafter.h"
 #include "model/drafter.h"
@@ -123,6 +124,34 @@ void check_precision(model::BatchDrafter::Precision precision, const char* name,
   const bool exact = precision == model::BatchDrafter::Precision::DRAFTER;
   std::snprintf(what, sizeof what, "%s: drafts agree with the Drafter's (>= %s)", name, exact ? "90%" : "50%");
   expect(agree >= (exact ? 0.9 : 0.5) && agree_first >= (exact ? 0.99 : 0.6), what);
+
+  // shorter blocks: an explicit gamma = GAMMA is the default; gamma < GAMMA writes columns < gamma only (the rest
+  // keeps the previous draft's), well formed and deterministic
+  {
+    const Out full = fetch(batch.draft(B, slots.data(), anchors.data(), P.data(), 0.f, 0), B, stream);
+    std::snprintf(what, sizeof what, "%s: gamma = 7 given explicitly gives the default's drafts", name);
+    expect(fetch(batch.draft(B, slots.data(), anchors.data(), P.data(), 0.f, 0, G), B, stream) == full, what);
+    for (const int gamma : {4, 2, 1}) {
+      const Out s = fetch(batch.draft(B, slots.data(), anchors.data(), P.data(), 0.f, 0, gamma), B, stream);
+      bool ok = true;
+      int first_same = 0;
+      for (int b = 0; b < B; ++b) {
+        first_same += s.tokens[std::size_t(b) * G] == full.tokens[std::size_t(b) * G];
+        for (int j = 0; j < G; ++j) {
+          const std::size_t at = std::size_t(b) * G + j;
+          if (j < gamma) ok = ok && s.tokens[at] >= 0 && s.tokens[at] < V && s.conf[at] > 0.f && s.conf[at] <= 1.f;
+          else ok = ok && s.tokens[at] == full.tokens[at] && s.conf[at] == full.conf[at];
+        }
+      }
+      std::printf("%s gamma %d: first drafts equal to gamma 7's for %d of %d sequences\n", name, gamma, first_same, B);
+      std::snprintf(what, sizeof what, "%s: gamma %d drafts well formed, other columns untouched", name, gamma);
+      expect(ok, what);
+      std::snprintf(what, sizeof what, "%s: gamma %d drafts deterministic", name, gamma);
+      expect(fetch(batch.draft(B, slots.data(), anchors.data(), P.data(), 0.f, 0, gamma), B, stream) == s, what);
+      // the full columns again for the next gamma's comparison
+      fetch(batch.draft(B, slots.data(), anchors.data(), P.data(), 0.f, 0), B, stream);
+    }
+  }
 
   // sampled drafts reproduce per seed
   const Out s1 = fetch(batch.draft(B, slots.data(), anchors.data(), P.data(), 0.8f, 5), B, stream);

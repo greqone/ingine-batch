@@ -6,12 +6,13 @@
 //         prompt + output, then (1) agreement: both drafters get the same committed rows and draft at the same
 //         anchors (all sequences in one BatchDrafter call, each at its own position): equal greedy drafts per
 //         draft index and the largest |conf| difference; (2) acceptance: a greedy speculative loop along the
-//         reference outputs per draft count k = 1..7 (draft, accept the matching prefix, commit the accepted rows
-//         + 1): mean accepted drafts per round. The BatchDrafter runs at both precisions (DRAFTER: the Drafter's
-//         weights and arithmetic; MXFP8: block-scaled FP8 projections).
+//         reference outputs per draft count k = 1..gamma of a block of 1 + gamma rows (draft, accept the matching
+//         prefix, commit the accepted rows + 1): mean accepted drafts per round. The BatchDrafter runs at both
+//         precisions (DRAFTER: the Drafter's weights and arithmetic; MXFP8: block-scaled FP8 projections; gamma 7,
+//         MXFP8 also gamma 6..2), with the calibration of conf at gamma 7 and 4.
 //     ingine-batch-draft --bench [--seqs 64 --ctx 640]
-//         draft() and commit() of 1..8 rows per sequence at n = --seqs (L2 flushed before each call, as a verify
-//         call in between does), and the drafter's device bytes.
+//         draft() for gamma 7..1 and commit() of 1..8 rows per sequence at n = --seqs (L2 flushed before each call,
+//         as a verify call in between does), and the drafter's device bytes.
 #include "core/device.h"
 #include "model/batch_drafter.h"
 #include "model/drafter.h"
@@ -152,10 +153,38 @@ std::vector<double> loop_single(m::Drafter& d, const std::vector<Seq>& seqs, cud
   return mean;
 }
 
-std::vector<double> loop_batch(m::BatchDrafter& d, const std::vector<Seq>& seqs, cudaStream_t stream) {
+// Calibration of conf: draft rows whose earlier drafts all matched, by conf bin and by draft index (rows past the
+// reference's end left out)
+struct Calibration {
+  static constexpr int BINS = 10;
+  long count[BINS] = {}, hits[BINS] = {}, index_count[G] = {}, index_hits[G] = {};
+  double conf_sum[BINS] = {}, index_conf[G] = {};
+  void add(int j, float c, bool hit) {
+    const int bin = std::min(BINS - 1, int(c * BINS));
+    ++count[bin], hits[bin] += hit, conf_sum[bin] += c;
+    ++index_count[j], index_hits[j] += hit, index_conf[j] += c;
+  }
+  void print(int gamma) const {
+    std::printf("   conf bin    rows   mean conf  hit rate\n");
+    for (int b = 0; b < BINS; ++b)
+      if (count[b] > 0)
+        std::printf("   %.1f-%.1f %7ld   %8.3f  %8.3f\n", double(b) / BINS, double(b + 1) / BINS, count[b],
+                    conf_sum[b] / double(count[b]), double(hits[b]) / double(count[b]));
+    std::printf("   draft index  rows   mean conf  hit rate\n");
+    for (int j = 0; j < gamma; ++j)
+      if (index_count[j] > 0)
+        std::printf("   %5d %9ld   %8.3f  %8.3f\n", j + 1, index_count[j], index_conf[j] / double(index_count[j]),
+                    double(index_hits[j]) / double(index_count[j]));
+  }
+};
+
+// mean accepted drafts per round for k = 1..gamma drafts per round (drafts of gamma); calibration of the k = gamma
+// loop
+std::vector<double> loop_batch(m::BatchDrafter& d, const std::vector<Seq>& seqs, cudaStream_t stream, int gamma,
+                               Calibration* calib) {
   const int B = int(seqs.size());
   std::vector<double> mean;
-  for (int k = 1; k <= G; ++k) {
+  for (int k = 1; k <= gamma; ++k) {
     long rounds = 0, acc = 0;
     std::vector<int> P(B);
     {
@@ -180,11 +209,14 @@ std::vector<double> loop_batch(m::BatchDrafter& d, const std::vector<Seq>& seqs,
         }
       const int n = int(slots.size());
       if (n == 0) break;
-      const Fetched f = fetch(d.draft(n, slots.data(), anchors.data(), pos.data(), 0.f, 0), n, stream);
+      const Fetched f = fetch(d.draft(n, slots.data(), anchors.data(), pos.data(), 0.f, 0, gamma), n, stream);
       for (int i = 0; i < n; ++i) {
         const int b = slots[std::size_t(i)];
         const int a = accepted(f.tokens.data() + std::size_t(i) * G, seqs[b], P[b], k);
         ++rounds, acc += a;
+        if (calib != nullptr && k == gamma)
+          for (int j = 0; j <= a && j < k && P[b] + 1 + j < int(seqs[b].ids.size()); ++j)
+            calib->add(j, f.conf[std::size_t(i) * G + j], j < a);
         const std::int32_t c = a + 1;
         const std::int64_t start = P[b];
         d.commit(1, &slots[std::size_t(i)], &start, &c, seqs[b].taps + std::size_t(P[b]) * ROW);
@@ -268,11 +300,20 @@ int check(const std::string& model_dir, const std::string& ref_file, int ctx) {
     single.capture();
     single_acc = loop_single(single, seqs, stream);
   }
-  std::printf("acceptance: mean accepted drafts per round, k = 1..7 drafts per round\n");
-  print_row("Drafter", single_acc);
+  std::printf("acceptance: mean accepted drafts per round, k = 1..gamma drafts per round (blocks of 1 + gamma rows)\n");
+  print_row("Drafter (gamma 7)", single_acc);
+  Calibration calib[G + 1];
   for (const auto& [p, name] : precisions) {
     m::BatchDrafter batch(model_dir, w, B, ctx, B, stream, p);
-    print_row(name, loop_batch(batch, seqs, stream));
+    for (int gamma = G; gamma >= (p == Precision::MXFP8 ? 2 : G); --gamma) {
+      char label[64];
+      std::snprintf(label, sizeof label, "%s gamma %d", name + 13, gamma);  // name without "BatchDrafter "
+      print_row(label, loop_batch(batch, seqs, stream, gamma, p == Precision::MXFP8 ? &calib[gamma] : nullptr));
+    }
+  }
+  for (const int gamma : {G, 4}) {
+    std::printf("conf calibration, MXFP8 gamma %d (k = %d: rows whose earlier drafts matched)\n", gamma, gamma);
+    calib[gamma].print(gamma);
   }
   CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
@@ -328,11 +369,14 @@ int bench(const std::string& model_dir, int seqs, int ctx, m::BatchDrafter::Prec
   std::vector<std::int64_t> P(seqs);
   for (int s = 0; s < seqs; ++s) slots[s] = s, anchors[s] = 1000 + 37 * s;
   // drafts at positions prompt .. prompt + 63 (the rows past the prompt are as good as empty context)
-  const float draft_ms = time([&](int i) {
-    for (int s = 0; s < seqs; ++s) P[s] = prompt + (s + i) % 64;
-    d.draft(seqs, slots.data(), anchors.data(), P.data(), 0.f, 0);
-  });
-  std::printf("draft  n %d: %.3f ms (median of %d, GPU time between events)\n", seqs, double(draft_ms), ITERS);
+  for (int gamma = m::BatchDrafter::GAMMA; gamma >= 1; --gamma) {
+    const float draft_ms = time([&](int i) {
+      for (int s = 0; s < seqs; ++s) P[s] = prompt + (s + i) % 64;
+      d.draft(seqs, slots.data(), anchors.data(), P.data(), 0.f, 0, gamma);
+    });
+    std::printf("draft  n %d gamma %d: %.3f ms (median of %d, GPU time between events)\n", seqs, gamma,
+                double(draft_ms), ITERS);
+  }
   for (int r = 1; r <= m::BatchDrafter::BLOCK; ++r) {
     std::vector<std::int32_t> count(seqs, r);
     std::vector<std::int64_t> start(seqs);

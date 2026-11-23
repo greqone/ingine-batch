@@ -67,16 +67,17 @@ class BatchDrafter {
   void commit(int n, const std::int32_t* slots, const std::int64_t* start, const std::int32_t* count,
               const __nv_bfloat16* feats);
 
-  // GAMMA drafts after anchor token anchors[i] at position P[i] of slot slots[i] (every position < P[i]
-  // committed), n <= max_seqs. Greedy at temperature <= 0, else Gumbel-max at the temperature with noise
-  // gumbel(seed, i, step, candidate) (vary the seed per call). Device outputs in fixed buffers, overwritten by
-  // the next draft().
+  // gamma (1..GAMMA) drafts after anchor token anchors[i] at position P[i] of slot slots[i] (every position < P[i]
+  // committed), n <= max_seqs: a block of 1 + gamma rows (anchor + gamma masks; the bidirectional attention sees only
+  // these, so the drafts differ from a longer block's) and gamma Markov steps. Greedy at temperature <= 0, else
+  // Gumbel-max at the temperature with noise gumbel(seed, i, step, candidate) (vary the seed per call). Device
+  // outputs in fixed buffers, overwritten by the next draft().
   struct Drafts {
-    const std::int32_t* tokens;  // int32 [n, 7]
+    const std::int32_t* tokens;  // int32 [n, 7]: columns < gamma
     const float* conf;           // fp32 [n, 7]: max softmax probability per row (as Drafter::Draft::conf)
   };
   Drafts draft(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* P,
-               float temperature, std::uint64_t seed);
+               float temperature, std::uint64_t seed, int gamma = GAMMA);
 
   int slots() const { return slots_; }
   int ctx() const { return ctx_; }

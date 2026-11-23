@@ -65,9 +65,10 @@ struct TileRegs {
   int cp;
 };
 
-// grid (chunks, KV_HEADS, n), block 128. ws_o fp32 [n, chunks, 8, 24, 128], ws_ml fp32 [n, chunks, 8, 24, 2].
+// grid (chunks, KV_HEADS, n), block 128: the sequence's first Rb of the 8 query rows (the others zero, their
+// outputs unused). ws_o fp32 [n, chunks, 8, 24, 128], ws_ml fp32 [n, chunks, 8, 24, 2].
 template <bool LOCAL, bool FP8>
-__global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bfloat16* q, DraftSeqs S, Ring R,
+__global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bfloat16* q, int Rb, DraftSeqs S, Ring R,
                                                                   const uint8_t* kb, const uint8_t* vb, int chunk_keys,
                                                                   float* ws_o, float* ws_ml) {
   constexpr int ROW_BYTES = FP8 ? HEAD_DIM : 2 * HEAD_DIM;
@@ -80,15 +81,15 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
   const int chunk = blockIdx.x, g = blockIdx.y, b = blockIdx.z, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
   const int gl = lane >> 2, t = lane & 3, lm = lane >> 3, lr = lane & 7;
   const int P = S.P[b], slot = S.slot[b];
-  const int nring = ring_keys(R, P), nkeys = nring + BLOCK;
+  const int nring = ring_keys(R, P), nkeys = nring + Rb;
   const int k0 = chunk * chunk_keys, kend = min(k0 + chunk_keys, nkeys);
   if (k0 >= nkeys) return;  // the combine reads only this sequence's chunks
   constexpr float scale = 0.08838834764831845f;
   // this sequence's slot, kv head g: rows [0, R.rows) of 128 values (head-major rings)
   const uint8_t* kr = static_cast<const uint8_t*>(R.k) + (size_t(slot) * KV_HEADS + g) * R.rows * ROW_BYTES;
   const uint8_t* vr = static_cast<const uint8_t*>(R.v) + (size_t(slot) * KV_HEADS + g) * R.rows * ROW_BYTES;
-  const uint8_t* kbb = kb + size_t(b) * BLOCK * KV_HEADS * ROW_BYTES;
-  const uint8_t* vbb = vb + size_t(b) * BLOCK * KV_HEADS * ROW_BYTES;
+  const uint8_t* kbb = kb + size_t(b) * Rb * KV_HEADS * ROW_BYTES;
+  const uint8_t* vbb = vb + size_t(b) * Rb * KV_HEADS * ROW_BYTES;
   const std::int32_t* rpos = LOCAL ? R.pos + size_t(slot) * R.rows : nullptr;
 
   auto load = [&](TileRegs<FP8>& x, int t0) {
@@ -116,7 +117,9 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
 #pragma unroll
     for (int j = 0; j < QH; ++j) {
       const int idx = tid + ATT_THREADS * j, hh = idx >> 7, r = (idx >> 4) & 7, piece = idx & 15;
-      qv[j] = *reinterpret_cast<const uint4*>(q + ((size_t(b) * BLOCK + r) * HEADS + g * QH + hh) * HEAD_DIM + 8 * piece);
+      qv[j] = r < Rb ? *reinterpret_cast<const uint4*>(q + ((size_t(b) * Rb + r) * HEADS + g * QH + hh) * HEAD_DIM +
+                                                         8 * piece)
+                     : make_uint4(0, 0, 0, 0);
     }
 #pragma unroll
     for (int j = 0; j < QH; ++j) {
@@ -254,14 +257,16 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
   }
 }
 
-// grid (KV_HEADS * NQ, n), block 128: thread c weighs chunk c, then every thread sums its dim over the chunks
+// grid (KV_HEADS * QH * Rb, n), block 128: query qi = head * 8 + row (row < Rb); thread c weighs chunk c, then
+// every thread sums its dim over the chunks
 __global__ void __launch_bounds__(HEAD_DIM) attn_combine_kernel(const float* ws_o, const float* ws_ml, int chunks,
-                                                               int chunk_keys, DraftSeqs S, Ring R,
+                                                               int chunk_keys, int Rb, DraftSeqs S, Ring R,
                                                                __nv_bfloat16* out, Mx out_mx) {
   __shared__ float scratch[33];
   __shared__ float f[HEAD_DIM];
-  const int g = blockIdx.x / NQ, qi = blockIdx.x % NQ, b = blockIdx.y, d = threadIdx.x;
-  const int mine = (ring_keys(R, S.P[b]) + BLOCK + chunk_keys - 1) / chunk_keys;  // this sequence's chunks
+  const int r = blockIdx.x % Rb, hh = (blockIdx.x / Rb) % QH, g = blockIdx.x / (Rb * QH);
+  const int qi = hh * BLOCK + r, b = blockIdx.y, d = threadIdx.x;
+  const int mine = (ring_keys(R, S.P[b]) + Rb + chunk_keys - 1) / chunk_keys;  // this sequence's chunks
   const size_t seq0 = size_t(b) * chunks;
   float mc = -INFINITY, lc = 0.f;
   if (d < mine) {
@@ -275,9 +280,9 @@ __global__ void __launch_bounds__(HEAD_DIM) attn_combine_kernel(const float* ws_
   const float l = block_sum(lc * fc, scratch);
   float o = 0.f;
   for (int c = 0; c < mine; ++c) o += ws_o[(((seq0 + c) * KV_HEADS + g) * NQ + qi) * HEAD_DIM + d] * f[c];
-  const int hh = qi / BLOCK, r = qi % BLOCK, h = g * QH + hh;
+  const int h = g * QH + hh;
   const float y = bf_round(l > 0.f ? o / l : 0.f);
-  const size_t row = size_t(b) * BLOCK + r;
+  const size_t row = size_t(b) * Rb + r;
   if (out != nullptr) out[row * Q_DIM + h * HEAD_DIM + d] = __float2bfloat16_rn(y);
   if (out_mx.q != nullptr) mx_store1(y, out_mx, Q_DIM, int(row), h * HEAD_DIM + d);
 }
@@ -293,10 +298,11 @@ std::size_t attention_workspace_floats(int max_seqs) {
   return most * KV_HEADS * NQ * (HEAD_DIM + 2);
 }
 
-void block_attention(const __nv_bfloat16* q, int n, const DraftSeqs& seqs, const Ring& ring, const void* kb,
+void block_attention(const __nv_bfloat16* q, int n, int Rb, const DraftSeqs& seqs, const Ring& ring, const void* kb,
                      const void* vb, int max_keys, float* ws, __nv_bfloat16* out, Mx out_mx, cudaStream_t stream) {
   if (n <= 0) return;
-  if (max_keys <= BLOCK) throw std::invalid_argument("bdraft::block_attention: max_keys must exceed the block");
+  if (Rb < 2 || Rb > BLOCK) throw std::invalid_argument("bdraft::block_attention: R must be in 2..8");
+  if (max_keys <= Rb) throw std::invalid_argument("bdraft::block_attention: max_keys must exceed the block");
   const int target = chunk_target(n);
   const int chunk_keys = std::max(2 * ATT_TILE, (max_keys + target - 1) / target + 2 * ATT_TILE - 1) / (2 * ATT_TILE) *
                          (2 * ATT_TILE);
@@ -308,15 +314,15 @@ void block_attention(const __nv_bfloat16* q, int n, const DraftSeqs& seqs, const
   const auto* v = static_cast<const uint8_t*>(vb);
   if (ring.pos != nullptr) {
     if (ring.fp8) throw std::invalid_argument("bdraft::block_attention: local rings are BF16");
-    attn_partial_kernel<true, false><<<grid, block, 0, stream>>>(q, seqs, ring, k, v, chunk_keys, ws_o, ws_ml);
+    attn_partial_kernel<true, false><<<grid, block, 0, stream>>>(q, Rb, seqs, ring, k, v, chunk_keys, ws_o, ws_ml);
   } else if (ring.fp8) {
-    attn_partial_kernel<false, true><<<grid, block, 0, stream>>>(q, seqs, ring, k, v, chunk_keys, ws_o, ws_ml);
+    attn_partial_kernel<false, true><<<grid, block, 0, stream>>>(q, Rb, seqs, ring, k, v, chunk_keys, ws_o, ws_ml);
   } else {
-    attn_partial_kernel<false, false><<<grid, block, 0, stream>>>(q, seqs, ring, k, v, chunk_keys, ws_o, ws_ml);
+    attn_partial_kernel<false, false><<<grid, block, 0, stream>>>(q, Rb, seqs, ring, k, v, chunk_keys, ws_o, ws_ml);
   }
   CUDA_CHECK(cudaGetLastError());
-  attn_combine_kernel<<<dim3(KV_HEADS * NQ, n), HEAD_DIM, 0, stream>>>(ws_o, ws_ml, chunks, chunk_keys, seqs, ring, out,
-                                                                       out_mx);
+  attn_combine_kernel<<<dim3(KV_HEADS * QH * Rb, n), HEAD_DIM, 0, stream>>>(ws_o, ws_ml, chunks, chunk_keys, Rb, seqs,
+                                                                            ring, out, out_mx);
   CUDA_CHECK(cudaGetLastError());
 }
 

@@ -1,9 +1,10 @@
 // Kernels of the batched DSpark drafter (model/batch_drafter.*): the arithmetic of kernels/draft (dspark.py)
-// for n sequences per call, each with its draft context in a slot. A drafted block is 8 rows per sequence:
-// rows b * 8 .. b * 8 + 7 belong to sequence b of the call. Per-sequence inputs are device arrays; the dense
-// projections between these kernels are GEMMs with BF16 outputs (rounded once): BF16 GEMMs over BF16 inputs, or
-// MXFP8 GEMMs (kernels/batch/mx_gemm.h) over the Mx copies the producing kernels write of their outputs. Plain
-// launches on `stream`; they never allocate or synchronise.
+// for n sequences per call, each with its draft context in a slot. A drafted block is R = 1 + gamma rows per
+// sequence (anchor + gamma masks, 2 <= R <= 8): rows b * R .. b * R + R - 1 belong to sequence b of the call;
+// draft step i of sequence b is row b * gamma + i of the head and Markov arrays. Per-sequence inputs are device
+// arrays; the dense projections between these kernels are GEMMs with BF16 outputs (rounded once): BF16 GEMMs over
+// BF16 inputs, or MXFP8 GEMMs (kernels/batch/mx_gemm.h) over the Mx copies the producing kernels write of their
+// outputs. Plain launches on `stream`; they never allocate or synchronise.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -78,31 +79,31 @@ void commit_store(const __nv_bfloat16* const kv[3], int rows, int row_base, cons
 
 // ---- draft block -----------------------------------------------------------------------------------------
 
-// Block input rows: res[b * 8] = bf16(rms(embed[anchor]) * embed_norm), res[b * 8 + 1..7] = mask_embed;
-// xn = bf16(rms(res) * in_norm) (bf16 [n * 8, H], if not null; its Mx copy to xn_mx); f_in[b] = f_rnn[slot]
-// (bf16 [n, H]).
-void embed_block(int n, const DraftSeqs& seqs, const __nv_bfloat16* embed, const float* embed_norm,
+// Block input rows (R per sequence): res[b * R] = bf16(rms(embed[anchor]) * embed_norm), res[b * R + 1..R-1] =
+// mask_embed; xn = bf16(rms(res) * in_norm) (bf16 [n * R, H], if not null; its Mx copy to xn_mx); f_in[b] =
+// f_rnn[slot] (bf16 [n, H]).
+void embed_block(int n, int R, const DraftSeqs& seqs, const __nv_bfloat16* embed, const float* embed_norm,
                  const __nv_bfloat16* mask_embed, const __nv_bfloat16* in_norm, const __nv_bfloat16* f_rnn,
                  __nv_bfloat16* res, __nv_bfloat16* xn, Mx xn_mx, __nv_bfloat16* f_in, cudaStream_t stream);
 
-// q/k/v of the block rows, qkv bf16 [n * 8, 5120]: q, k = bf16(rope(bf16(rms_head * norm))) at positions P + r;
-// q -> q_out bf16 [n * 8, 24, 128]; k, v -> kb, vb [n * 8, 8, 128] (E4M3 if fp8, else BF16).
-void qkv_rope(const __nv_bfloat16* qkv, int n, const DraftSeqs& seqs, const __nv_bfloat16* q_norm,
+// q/k/v of the block rows, qkv bf16 [n * R, 5120]: q, k = bf16(rope(bf16(rms_head * norm))) at positions P + r;
+// q -> q_out bf16 [n * R, 24, 128]; k, v -> kb, vb [n * R, 8, 128] (E4M3 if fp8, else BF16).
+void qkv_rope(const __nv_bfloat16* qkv, int n, int R, const DraftSeqs& seqs, const __nv_bfloat16* q_norm,
               const __nv_bfloat16* k_norm, __nv_bfloat16* q_out, void* kb, void* vb, bool fp8, cudaStream_t stream);
 
 // Bidirectional block attention of each sequence (scale 1/sqrt(128), GQA head h -> kv head h / 3) over its
-// slot's ring (see Ring) and its 8 block rows (kb, vb as qkv_rope wrote them, the ring's precision); out bf16
-// [n * 8, 3072] (if not null; its Mx copy to out_mx). max_keys: the most keys of any sequence (ring rows it may
-// read + 8), bounding the chunks. ws: attention_workspace_floats(max_seqs) floats.
+// slot's ring (see Ring) and its R block rows (kb, vb as qkv_rope wrote them, the ring's precision); out bf16
+// [n * R, 3072] (if not null; its Mx copy to out_mx). max_keys: the most keys of any sequence (ring rows it may
+// read + R), bounding the chunks. ws: attention_workspace_floats(max_seqs) floats.
 std::size_t attention_workspace_floats(int max_seqs);
-void block_attention(const __nv_bfloat16* q, int n, const DraftSeqs& seqs, const Ring& ring, const void* kb,
+void block_attention(const __nv_bfloat16* q, int n, int R, const DraftSeqs& seqs, const Ring& ring, const void* kb,
                      const void* vb, int max_keys, float* ws, __nv_bfloat16* out, Mx out_mx, cudaStream_t stream);
 
 // res = bf16(res + delta); xn = bf16(rms(res) * w), rows of H (xn if not null; its Mx copy to xn_mx). With h_out
-// (bf16 [n * 7, H]) / h_mx the normed rows 1..7 of each block also go there, compacted (row b * 8 + i -> b * 7 +
-// i - 1).
+// (bf16 [n * (R - 1), H]) / h_mx the normed rows 1..R-1 of each block of R rows also go there, compacted (row
+// b * R + i -> b * (R - 1) + i - 1).
 void add_rmsnorm(__nv_bfloat16* res, const __nv_bfloat16* delta, const __nv_bfloat16* w, __nv_bfloat16* xn, Mx xn_mx,
-                 int rows, __nv_bfloat16* h_out, Mx h_mx, cudaStream_t stream);
+                 int rows, int R, __nv_bfloat16* h_out, Mx h_mx, cudaStream_t stream);
 
 // out = bf16(silu(gate) * up), gu bf16 [rows, 2I] (gate | up), out bf16 [rows, I] (if not null; its Mx copy to
 // out_mx).
@@ -117,16 +118,16 @@ void silu_mul(const __nv_bfloat16* gu, int rows, int inter, __nv_bfloat16* out, 
 void topk_candidates(const __nv_bfloat16* base, int rows, int S, int ld, float* cand_val, std::int32_t* cand_idx,
                      cudaStream_t stream);
 
-// The 7 steps of every sequence (kernels::draft markov_step / markov_logits / markov_finish), a cluster of two CTAs
-// per sequence.
+// The gamma (1..7) steps of every sequence (kernels::draft markov_step / markov_logits / markov_finish), a cluster
+// of two CTAs per sequence.
 // Step i: prev = anchor (i = 0) or the token drafted at step i - 1; raw = bf16(bf16(rnn_w[:, :512] [state_i,
-// W1[prev]] + part_h[b * 7 + i] + part_f[b]) + rnn_b) (part_h fp32 [n * 7, 768], part_f fp32 [n, 768]: the h and
-// f_rnn parts of the projection), the gates give state_{i+1} (state_0 = 0) and the latent; candidate k's logit =
-// bf16(30 tanh(bf16(cand_val + bf16(fold_b + bf16(fold_w . latent))) / 30)) (fold_w bf16 [S, 256], fold_b bf16
-// [S] by shortlist row); the pick = argmax of the logits (temperature <= 0) or of logits / T + Gumbel noise
-// gumbel(seed, b, i, k), lowest k on ties. tokens int32 [n, 7] = map[cand_idx of the pick]; conf fp32 [n, 7] =
-// max softmax probability of the step's logits.
-void markov_draft(int n, const DraftSeqs& seqs, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b,
+// W1[prev]] + part_h[b * gamma + i] + part_f[b]) + rnn_b) (part_h fp32 [n * gamma, 768], part_f fp32 [n, 768]: the
+// h and f_rnn parts of the projection), the gates give state_{i+1} (state_0 = 0) and the latent; candidate k's
+// logit = bf16(30 tanh(bf16(cand_val + bf16(fold_b + bf16(fold_w . latent))) / 30)) (fold_w bf16 [S, 256], fold_b
+// bf16 [S] by shortlist row; cand_* rows b * gamma + i); the pick = argmax of the logits (temperature <= 0) or of
+// logits / T + Gumbel noise gumbel(seed, b, i, k), lowest k on ties. tokens int32 [n, 7] = map[cand_idx of the
+// pick]; conf fp32 [n, 7] = max softmax probability of the step's logits (columns i < gamma written).
+void markov_draft(int n, int gamma, const DraftSeqs& seqs, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b,
                   const __nv_bfloat16* w1, const float* part_h, const float* part_f, const float* cand_val,
                   const std::int32_t* cand_idx, const std::int32_t* map, const __nv_bfloat16* fold_w,
                   const __nv_bfloat16* fold_b, float temperature, std::uint64_t seed, std::int32_t* tokens, float* conf,
