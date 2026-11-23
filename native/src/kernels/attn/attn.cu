@@ -109,11 +109,13 @@ constexpr float QSCALE = 0.08838834764831845f * LOG2E;  // 1/sqrt(128) * log2(e)
 constexpr float NEG_INIT = -1e30f;
 constexpr float INV_SQRT5 = 1.f / 2.2360679774997896f;  // torch: x / scalar == x * (1 / float(scalar))
 constexpr float INV_3 = 1.f / 3.f;
-// workspace: int32 counter (kpos ordering for M > 1, zeroed once at allocation) then the split partials
-// fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
-constexpr size_t WS_PART = 256;
+// workspace: one int32 counter per sequence (kpos ordering for M > 1, zeroed once at allocation, reset by the
+// kernel), padded to 256 bytes, then per sequence the split partials fp32 [HKV][CS][3M][PSTR]: o (D) then
+// (max, sum). One sequence: the counter in the first 256 bytes, the partials after it.
 constexpr int PSTR = D + 4;
-constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_counter_bytes(int batch) { return (size_t(batch) * 4 + 255) / 256 * 256; }
+constexpr size_t ws_part_floats(int M) { return size_t(HKV) * CS * GQA * M * PSTR; }
+constexpr size_t ws_bytes(int M, int batch = 1) { return ws_counter_bytes(batch) + size_t(batch) * ws_part_floats(M) * 4; }
 
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
@@ -200,7 +202,7 @@ __device__ __forceinline__ void mma_f16(float (&d)[4], const uint32_t (&a)[4], c
 struct Params {
     const float* proj;
     int R;
-    long long cap;  // cache rows (full layers)
+    long long cap;  // cache rows: full layers; sliding rings below 1024 rows (positions never wrap)
     int log_scaling;
     const float* q_scale;
     const float* r_scale;
@@ -216,6 +218,10 @@ struct Params {
     int* counter;
     float* part;
     __nv_bfloat16* out;
+    // grid z = a batch of sequences: sequence z works on slot slots[z] (z without a table). The caches, kpos and
+    // conv states advance by the slot strides (elements), proj / out / pos / counter / partials by the sequence.
+    const int* slots;
+    long long cache_stride, kpos_stride, conv_stride, part_stride;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
 };
 
@@ -367,8 +373,18 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     const int tok = warp / KW, kw = warp % KW;
     const bool owner = rank == 0;
     const int R = p.R;
-    CT* const kc = static_cast<CT*>(p.k_cache);
-    CT* const vc = static_cast<CT*>(p.v_cache);
+    // this sequence's slot: the slot table is written before the step, never by the kernels before this one
+    const int seq_z = blockIdx.z;
+    const long long slot_z = p.slots ? (long long)p.slots[seq_z] : (long long)seq_z;
+    CT* const kc = static_cast<CT*>(p.k_cache) + slot_z * p.cache_stride;
+    CT* const vc = static_cast<CT*>(p.v_cache) + slot_z * p.cache_stride;
+    long long* const kpos_z = p.kpos ? p.kpos + slot_z * p.kpos_stride : nullptr;
+    float* const conv_kz = p.conv_k + slot_z * p.conv_stride;
+    float* const conv_vz = p.conv_v + slot_z * p.conv_stride;
+    const float* const proj_z = p.proj + size_t(seq_z) * M * R;
+    __nv_bfloat16* const out_z = p.out + size_t(seq_z) * M * HQ * D;
+    float* const part_z = p.part + size_t(seq_z) * p.part_stride;
+    int* const counter_z = p.counter + seq_z;
 
     // ---- stage the inputs in shared memory with cp.async (one round trip, no registers held). Weights
     // first: they may be read before the previous kernel completes (programmatic dependent launch).
@@ -383,9 +399,12 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         for (int i = tid; i < DREL * 2; i += NT)  // rel_proj[:, 0..7]: the new keys' distances
             cp16(sm + L::RELP0 + 4 * i, p.rel_proj + (i / 2) * EXT + 4 * (i % 2));
     }
-    const int p0 = int(ld_s64(p.pos));
-    if (FULL && p0 + M > p.cap) return;  // out of cache capacity (uniform: no block reaches a barrier)
-    const int L_old = FULL ? p0 : WIN;
+    const int p0 = int(ld_s64(p.pos + seq_z));
+    // out of cache capacity (uniform: no block reaches a barrier); a ring below 1024 rows must not wrap
+    if ((FULL || p.cap < WIN) && p0 + M > p.cap) return;
+    // old keys: the linear cache up to p0; the ring's 1024 slots, or before it wraps (p0 < 1024) slots
+    // 0..p0-1 = positions 0..p0-1 (the rest is empty: same result, without reading it)
+    const int L_old = FULL ? p0 : min(p0, WIN);
     const int P = p0 + tok;
 
     // ---- K/V streaming: two register buffers; the first two are issued now, K/V before the rel_proj
@@ -409,7 +428,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                     b.k[u] = ld_kv(kc + off, kvpol);
                     b.v[u] = ld_kv(vc + off, kvpol);
                 }
-                b.kp[u] = FULL ? j : int(ld_s64(p.kpos + j));
+                b.kp[u] = FULL ? j : int(ld_s64(kpos_z + j));
             }
         }
     };
@@ -452,7 +471,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         if constexpr (!FULL) {
             for (int i = tid; i < KT; i += NT)  // low word of the int64 position
                 cp4z(reinterpret_cast<float*>(kps + st * KT + i),
-                     reinterpret_cast<const float*>(p.kpos + (base + i < L_old ? base + i : 0)), base + i < L_old);
+                     reinterpret_cast<const float*>(kpos_z + (base + i < L_old ? base + i : 0)), base + i < L_old);
         }
         const int dbase = dbase_of(base);
         if (dbase < EXT) {
@@ -503,28 +522,28 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll 1
     for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
     for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
-        cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
+        cp16(sm + L::Q + 4 * i, proj_z + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
     for (int i = tid; i < M * GQA * DREL / 4; i += NT)
         cp16(sm + L::REL + 4 * i,
-             p.proj + size_t(i / (GQA * DREL / 4)) * R + OFF_REL + g * GQA * DREL + 4 * (i % (GQA * DREL / 4)));
+             proj_z + size_t(i / (GQA * DREL / 4)) * R + OFF_REL + g * GQA * DREL + 4 * (i % (GQA * DREL / 4)));
     for (int i = tid; i < ROWS * OD / 4; i += NT) {
         const int row = i / (OD / 4), part = i % (OD / 4);
         cp16(sm + L::GATE + 4 * i,
-             p.proj + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + rank * OD + 4 * part);
+             proj_z + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + rank * OD + 4 * part);
     }
-    for (int i = tid; i < ROWS; i += NT) cp4(sm + L::SINK + i, p.proj + size_t(i / GQA) * R + OFF_SINK + g * GQA + i % GQA);
+    for (int i = tid; i < ROWS; i += NT) cp4(sm + L::SINK + i, proj_z + size_t(i / GQA) * R + OFF_SINK + g * GQA + i % GQA);
     if (owner) {
         for (int i = tid; i < 3 * 2 * D / 4; i += NT) {  // [j][kv][D]
             const int j = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
-            cp16(sm + L::ST + 4 * i, (kv ? p.conv_v : p.conv_k) + j * CONV_C + g * D + 4 * q);
+            cp16(sm + L::ST + 4 * i, (kv ? conv_vz : conv_kz) + j * CONV_C + g * D + 4 * q);
         }
         for (int i = tid; i < M * 2 * D / 4; i += NT) {  // [m][kv][D]
             const int m = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
-            cp16(sm + L::X + 4 * i, p.proj + size_t(m) * R + (kv ? OFF_V : OFF_K) + g * D + 4 * q);
+            cp16(sm + L::X + 4 * i, proj_z + size_t(m) * R + (kv ? OFF_V : OFF_K) + g * D + 4 * q);
         }
         if constexpr (FULL) {
             for (int i = tid; i < M * 2; i += NT)
-                cp16(sm + L::DYN + 4 * i, p.proj + size_t(i / 2) * R + (i % 2 ? OFF_VDYN : OFF_KDYN) + g * 4);
+                cp16(sm + L::DYN + 4 * i, proj_z + size_t(i / 2) * R + (i % 2 ? OFF_VDYN : OFF_KDYN) + g * 4);
         }
     }
 
@@ -797,7 +816,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         __syncthreads();
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
-        float* part = p.part + size_t(g * CS + rank) * ROWS * PSTR;
+        float* part = part_z + size_t(g * CS + rank) * ROWS * PSTR;
         for (int idx = tid; idx < ROWS * (D / 4); idx += NT) {
             const int row = idx / (D / 4), d4 = idx % (D / 4);
             float mx = NEG_INIT;
@@ -1084,7 +1103,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
 
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
-        float* part = p.part + size_t(g * CS + rank) * ROWS * PSTR;
+        float* part = part_z + size_t(g * CS + rank) * ROWS * PSTR;
 #pragma unroll
         for (int n = 0; n < NTN; ++n) {
 #pragma unroll
@@ -1105,17 +1124,17 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
         __threadfence();
-        if (atomicAdd(p.counter, 1) == HKV - 1) {
+        if (atomicAdd(counter_z, 1) == HKV - 1) {
             __threadfence();
-            for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
-            *p.counter = 0;
+            for (int m = 0; m < M; ++m) kpos_z[(p0 + m) & (WIN - 1)] = p0 + m;
+            *counter_z = 0;
         }
     }
 
     // block `rank` outputs dims 8 rank .. 8 rank + 7 of every row: thread (row, dim) = (tid / 8, tid % 8)
     if (tid < ROWS * OD) {
         const int row = tid / OD, dim = rank * OD + tid % OD;
-        const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
+        const float* src = part_z + size_t(g * CS) * ROWS * PSTR + row * PSTR;
         float2 ml[CS];
         float o[CS];
 #pragma unroll
@@ -1135,7 +1154,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             a += o[q] * f;
         }
         const float gate = 1.f / (1.f + expf(-sm[L::GATE + tid]));
-        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+        out_z[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
     }
 
     // owner: the global writes, at the end so they delay nothing (and, for M > 1 on a ring, because the
@@ -1157,9 +1176,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
             const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
-            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
+            (kv ? conv_vz : conv_kz)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
         }
-        if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
+        if (!FULL && M == 1 && g == 0 && tid == 0) kpos_z[p0 & (WIN - 1)] = p0;
     }
 }
 
@@ -1202,9 +1221,9 @@ Kernel select(int M) {
 
 // attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (the kernel waits with
 // griddepcontrol.wait before touching anything an earlier kernel may write; a no-op without PDL)
-cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs) {
+cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs, int batch = 1) {
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(CS, HKV);
+    cfg.gridDim = dim3(CS, HKV, batch);
     cfg.blockDim = dim3(NT);
     cfg.dynamicSmemBytes = k.smem;
     cfg.stream = stream;
@@ -1219,9 +1238,10 @@ cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunc
 
 }  // namespace
 
-std::size_t workspace_bytes(int max_m) {
+std::size_t workspace_bytes(int max_m, int max_batch) {
     require(max_m >= 1 && max_m <= MAXM, "max_m must be in 1..8");
-    return ws_bytes(max_m);
+    require(max_batch >= 1 && max_batch <= 65535, "max_batch must be in 1..65535");
+    return ws_bytes(max_m, max_batch);
 }
 
 int max_active_clusters(int M, int window) {
@@ -1241,6 +1261,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     const bool full = a.window == 0;
     const int M = a.M;
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    require(a.batch >= 1 && a.batch <= 65535, "batch must be in 1..65535");
     require(a.proj && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_state &&
                 a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
@@ -1248,10 +1269,12 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
     if (!full) {
-        require(a.cache_rows == WIN, "sliding caches must have 1024 rows");
+        require(a.cache_rows <= WIN, "sliding caches hold at most 1024 rows");
         require(a.kpos != nullptr, "sliding layers need kpos");
     }
-    require(a.workspace_size >= ws_bytes(M), "workspace too small: need workspace_bytes(M)");
+    require(a.batch == 1 || (a.cache_stride > 0 && a.conv_stride > 0 && (full || a.kpos_stride > 0)),
+            "a batch needs the slot strides");
+    require(a.workspace_size >= ws_bytes(M, a.batch), "workspace too small: need workspace_bytes(M, batch)");
 
     Params p{};
     p.proj = a.proj;
@@ -1270,11 +1293,16 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.kpos = full ? nullptr : reinterpret_cast<long long*>(a.kpos);
     p.pos = reinterpret_cast<const long long*>(a.pos);
     p.counter = static_cast<int*>(a.workspace);
-    p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
+    p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + ws_counter_bytes(a.batch));
     p.out = a.out;
+    p.slots = a.slots;
+    p.cache_stride = a.cache_stride;
+    p.kpos_stride = a.kpos_stride;
+    p.conv_stride = a.conv_stride;
+    p.part_stride = (long long)ws_part_floats(M);
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
     cudaLaunchAttribute attrs[2];
-    const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
+    const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs, a.batch);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
 }
 

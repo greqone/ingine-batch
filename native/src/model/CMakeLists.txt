@@ -4,6 +4,7 @@ add_library(ingine_model STATIC
   decoder.cpp
   runtime.cpp
   generator.cpp
+  batch.cpp
   model_kernels.cu
 )
 # prefill (package Prefill) and the speculative loop (package Spec)
@@ -13,6 +14,7 @@ foreach(src prefill.cpp drafter.cpp spec.cpp)
   endif()
 endforeach()
 ingine_cuda_target(ingine_model)
+target_link_libraries(ingine_model PUBLIC ingine_kernels_batch)
 ingine_internal_includes(ingine_model)
 target_include_directories(ingine_model PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(ingine_model PUBLIC

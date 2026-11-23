@@ -41,9 +41,11 @@ class Gemm {
 // Keys/values of one sliding visit for the chunk: rows [0, 1024) are the ring before the chunk, rotated so
 // row i holds slot (pos0 + i) % 1024 (position order for a filled ring), rows [1024, 1024 + T) the chunk.
 // ring_gather fills rows [0, 1024) and the positions of every row (kpos int32 [kpos_rows], -1 = empty, padding
-// rows -1); attn_prep writes the chunk rows.
-void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int pos0, int T,
-                 __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream);
+// rows -1); attn_prep writes the chunk rows. A ring of ring_rows < 1024 rows (one that never wraps) has no slots
+// from ring_rows on: their rows come out empty (position -1, zero keys and values).
+void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int ring_rows,
+                 int pos0, int T, __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows,
+                 cudaStream_t stream);
 
 // model.prefill's ring update: the last min(T, 1024) chunk rows (rows 1024.. of k_rows/v_rows) into their slots
 // (pos % 1024), ring_pos = pos.

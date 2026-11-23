@@ -185,7 +185,7 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
   DeviceArray<int> kp(kpos_rows);
   DeviceArray<int4> bounds(kpos_rows / 64);
   pk::ring_gather(reinterpret_cast<const __nv_bfloat16*>(ring_k.get()),
-                  reinterpret_cast<const __nv_bfloat16*>(ring_v.get()), rpos.get(), pos0, T,
+                  reinterpret_cast<const __nv_bfloat16*>(ring_v.get()), rpos.get(), 1024, pos0, T,
                   reinterpret_cast<__nv_bfloat16*>(kr.get()), reinterpret_cast<__nv_bfloat16*>(vr.get()), kp.get(),
                   kpos_rows, nullptr);
   pk::key_tile_bounds(kp.get(), L, bounds.get(), nullptr);

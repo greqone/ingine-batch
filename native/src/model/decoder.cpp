@@ -198,7 +198,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.k_cache = st.k_ring_at(ri).data;
       a.v_cache = st.v_ring_at(ri).data;
       a.cache_fp8 = false;
-      a.cache_rows = WINDOW;
+      a.cache_rows = st.ring_rows;
       a.kpos = st.ring_pos_at(ri);
       a.window = WINDOW;
       a.log_scaling = false;

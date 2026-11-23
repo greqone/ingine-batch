@@ -227,8 +227,11 @@ struct Ablation {
 struct State {
   int max_ctx = 0;
   bool kv_fp8 = false;
-  Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
-  Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
+  Tensor k_ring, v_ring;      // bf16 [40, ring_rows, 8, 128] (sliding visits, RING_INDEX)
+  Tensor ring_pos;            // int64 [40, ring_rows], absolute position per slot, -1 = empty
+  // rows per sliding ring: WINDOW, or fewer when the context never exceeds them (the ring never wraps; batch
+  // slots). The single-request runtime (checkpoints, rollback) always has WINDOW.
+  int ring_rows = WINDOW;
   Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, 8, 128] (full visits, FULL_INDEX)
   Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]

@@ -25,6 +25,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "model/batch.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
 
@@ -34,6 +35,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -58,7 +60,9 @@ struct Args {
   fs::path golden = fs::path(INGINE_REPO_DIR) / "native" / "tests" / "golden" / "model";
   std::string filter;
   bool generate = false;
-  bool spec = false;  // --generate / --path with DSpark speculative decoding
+  bool spec = false;   // --generate / --path with DSpark speculative decoding
+  bool batch = false;  // --batch: the pieces through the batched decoder, every case of a group at once
+  int dense_fp8 = -1;  // --dense-bf16 / --dense-fp8: the dense rows the C++ side runs (default: the goldens')
   int path_tokens = 0;        // --path N
   double tie_margin = 0.5;    // --tie-margin X
   double max_gap_rate = -1;   // --max-gap-rate R: tokens per 10,000 above the margin (off: per-case maximum)
@@ -70,10 +74,11 @@ struct Args {
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
-      "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
-      "                       [--min-top1 F]\n"
+      "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--batch] [--dense-bf16 | --dense-fp8]\n"
+      "                       [--max-kl X] [--max-mean-kl X] [--min-top1 F]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
-      "plain-projection file the goldens of the abliterated model were made with\n");
+      "plain-projection file the goldens of the abliterated model were made with. --batch runs the pieces through the\n"
+      "batched decoder (model/batch.h): every case of a configuration in its own slot, decoded together\n");
 }
 
 struct Stage {
@@ -168,6 +173,85 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
     std::printf("%-22s decode  (%2d steps):     KL mean %.3e max %.3e  top1 %d/%d  max|dlogit| %.4f\n", name.c_str(),
                 steps, steps ? sum_kl / steps : 0.0, max_kl, agree, steps, max_diff);
   }
+}
+
+// The pieces through the batched decoder: each case's prompt prefilled into its own slot (chunked as the goldens
+// were), then the golden greedy tokens teacher forced through batched steps, every case one row of the same step at
+// its own position; per stage the same comparison as run_pieces.
+void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, Totals& tot) {
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  {
+    const Weights w = load_weights(opt.model_dir, opt.dense_fp8, stream);
+    const Ablation abl = load_ablation(opt.ablation);
+    const int n = int(cases.size());
+    int ctx = 2, steps = 1 << 30;
+    for (const auto& c : cases) {
+      ctx = std::max(ctx, int(c.at("prompt_ids").size() + c.at("decode").size()) + 1);
+      steps = std::min(steps, int(c.at("decode").size()));
+    }
+    BatchState st = make_batch_state(n, ctx, opt.kv_fp8);
+    Prefiller prefiller(w, abl, opt.prefill_chunk, stream);
+    BatchDecoder dec(w, abl, st, n, stream);
+    DeviceBuffer tokens(std::size_t(opt.prefill_chunk) * 4), logits(std::size_t(UNPADDED_VOCAB) * 4);
+    std::vector<float> host(UNPADDED_VOCAB);
+    auto fetch = [&](const float* d, bool raw) {
+      CUDA_CHECK(cudaMemcpyAsync(host.data(), d, host.size() * 4, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (raw)  // model.logits = 30 tanh(bf16(l) / 30)
+        for (float& v : host) {
+          std::uint32_t u;
+          std::memcpy(&u, &v, 4);
+          u = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+          float r;
+          std::memcpy(&r, &u, 4);
+          v = 30.f * std::tanh(r / 30.f);
+        }
+    };
+    for (int b = 0; b < n; ++b) {
+      const auto& c = cases[std::size_t(b)];
+      const std::vector<std::int32_t> ids = c.at("prompt_ids").get<std::vector<std::int32_t>>();
+      reset_slot(st, b, stream);
+      State v = st.view(b);
+      for (int s = 0; s < int(ids.size()); s += opt.prefill_chunk) {
+        const int T = std::min(opt.prefill_chunk, int(ids.size()) - s);
+        CUDA_CHECK(cudaMemcpyAsync(tokens.p, ids.data() + s, std::size_t(T) * 4, cudaMemcpyHostToDevice, stream));
+        prefiller.run(v, static_cast<const std::int32_t*>(tokens.p), T, s, static_cast<float*>(logits.p), nullptr);
+      }
+      fetch(static_cast<const float*>(logits.p), false);
+      const Stage pre = compare(c.at("prefill"), host);
+      tot.add(pre);
+      std::printf("%-22s prefill (%5zu tokens): KL %.3e  top1 %s  max|dlogit| %.4f\n",
+                  c.at("name").get<std::string>().c_str(), ids.size(), pre.kl, pre.top1 ? "ok" : "MISS", pre.max_diff);
+    }
+    std::vector<double> sum_kl(n), max_kl(n), max_diff(n);
+    std::vector<int> agree(n);
+    std::vector<std::int32_t> in_tok(n), in_slot(n);
+    std::vector<std::int64_t> in_pos(n);
+    for (int k = 0; k < steps; ++k) {
+      for (int b = 0; b < n; ++b) {
+        const auto& step = cases[std::size_t(b)].at("decode").at(k);
+        in_tok[b] = step.at("input_token").get<std::int32_t>();
+        in_slot[b] = b;
+        in_pos[b] = step.at("pos").get<std::int64_t>();
+      }
+      dec.step(n, in_tok.data(), in_slot.data(), in_pos.data(), 0.f, 0);
+      for (int b = 0; b < n; ++b) {
+        fetch(dec.logits() + std::size_t(b) * BatchDecoder::kLogitsLd, dec.logits_raw());
+        const Stage s = compare(cases[std::size_t(b)].at("decode").at(k), host);
+        tot.add(s);
+        sum_kl[b] += s.kl;
+        max_kl[b] = std::max(max_kl[b], s.kl);
+        max_diff[b] = std::max(max_diff[b], s.max_diff);
+        agree[b] += s.top1;
+      }
+    }
+    for (int b = 0; b < n; ++b)
+      std::printf("%-22s batch   (%2d steps, %d rows): KL mean %.3e max %.3e  top1 %d/%d  max|dlogit| %.4f\n",
+                  cases[std::size_t(b)].at("name").get<std::string>().c_str(), steps, n, sum_kl[b] / steps, max_kl[b],
+                  agree[b], steps, max_diff[b]);
+  }
+  CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
 // A fresh Generator per case: the golden prompts share prefixes (t300 starts t2100 starts t5000), and a Generator
@@ -291,6 +375,9 @@ int main(int argc, char** argv) {
     else if (k == "--cases") a.filter = val();
     else if (k == "--generate") a.generate = true;
     else if (k == "--spec") a.spec = true;
+    else if (k == "--batch") a.batch = true;
+    else if (k == "--dense-bf16") a.dense_fp8 = 0;
+    else if (k == "--dense-fp8") a.dense_fp8 = 1;
     else if (k == "--path") a.path_tokens = std::stoi(val());
     else if (k == "--tie-margin") a.tie_margin = std::stod(val());
     else if (k == "--max-gap-rate") a.max_gap_rate = std::stod(val());
@@ -332,7 +419,7 @@ int main(int argc, char** argv) {
       opt.model_dir = a.model_dir;
       opt.ablation = key.first ? a.ablation : fs::path();
       opt.kv_fp8 = key.second;
-      opt.dense_fp8 = manifest.value("dense_fp8", true);
+      opt.dense_fp8 = a.dense_fp8 >= 0 ? a.dense_fp8 == 1 : manifest.value("dense_fp8", true);
       opt.max_ctx = manifest.value("max_ctx", 8192);
       opt.prefill_chunk = manifest.value("prefill_chunk", 2048);
       opt.spec = a.generate && a.spec;
@@ -340,6 +427,7 @@ int main(int argc, char** argv) {
                   key.second ? "FP8" : "BF16");
       if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);
       else if (a.generate) run_generate(opt, cases, tot);
+      else if (a.batch) run_batch(opt, cases, tot);
       else run_pieces(opt, cases, tot);
     }
     const double top1 = tot.stages ? double(tot.top1) / tot.stages : 0.0;

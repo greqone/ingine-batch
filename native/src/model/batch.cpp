@@ -1,0 +1,398 @@
+// Batched decoding (batch.h): request slots and one decode step over many sequences, wired as Prefiller::run with
+// one row per sequence. Differences from the prefill: the projections are widened to the FP32 rows of the decode
+// attention kernel, which attends over each sequence's own slot (positions, caches, conv states), the short
+// convolutions continue each slot's state, and the head runs on every row.
+#include "model/batch.h"
+
+#include "core/device.h"
+#include "ingine/generator.h"
+#include "kernels/attn/attn.h"
+#include "kernels/batch/batch.h"
+#include "kernels/dense/dense.h"
+#include "kernels/prefill/prefill.h"
+
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+
+namespace ingine::model {
+namespace pk = kernels::prefill;
+namespace dense = kernels::dense;
+namespace attn = kernels::attn;
+namespace kb = kernels::batch;
+
+namespace {
+
+constexpr int H = HIDDEN;
+constexpr int LD_V = BatchDecoder::kLogitsLd;  // row stride of the logits (aligned rows for cuBLASLt)
+
+const float* f32p(const Tensor& t) { return static_cast<const float*>(t.data); }
+const __nv_bfloat16* bf16p(const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); }
+
+Tensor zeros(std::vector<DeviceBuffer>& storage, DType dt, std::initializer_list<std::int32_t> shape) {
+  std::size_t n = 1;
+  for (std::int32_t d : shape) n *= std::size_t(d);
+  storage.emplace_back(n * dtype_size(dt));
+  CUDA_CHECK(cudaMemset(storage.back().p, 0, storage.back().bytes));
+  return rm(storage.back().p, dt, shape);
+}
+
+// fast.Buffers.blocks (as prefill.cpp)
+std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* B1, float* const* B2, float* const* E) {
+  if (l < 1) return {};
+  if (l < 7) return {B0};
+  if (l < 13) return {B0, B1};
+  if (l < 19) return {B0, B1, B2[l < LOOP_END ? p : 2]};
+  return {B0, B1, B2[2], E[2]};
+}
+
+}  // namespace
+
+// ------------------------------------------------------------------------------------------------- state
+
+std::size_t BatchState::device_bytes() const {
+  std::size_t n = 0;
+  for (const auto& b : storage) n += b.bytes;
+  return n;
+}
+
+State BatchState::view(int s) const {
+  if (s < 0 || s >= slots) throw std::out_of_range("BatchState::view: slot " + std::to_string(s));
+  State v;
+  v.max_ctx = ctx;
+  v.kv_fp8 = kv_fp8;
+  v.ring_rows = ring_rows;
+  const std::size_t es = kv_fp8 ? 1 : 2;
+  auto at = [](const Tensor& t, std::size_t bytes) { return static_cast<char*>(t.data) + bytes; };
+  v.k_ring = rm(at(k_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {NUM_SLIDING_VISITS, ring_rows, KV_HEADS, HEAD_DIM});
+  v.v_ring = rm(at(v_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {NUM_SLIDING_VISITS, ring_rows, KV_HEADS, HEAD_DIM});
+  v.ring_pos = rm(at(ring_pos, std::size_t(s) * kpos_stride() * 8), DType::I64, {NUM_SLIDING_VISITS, ring_rows});
+  v.k_full = rm(at(k_full, std::size_t(s) * full_stride() * es), k_full.dtype, {NUM_FULL_VISITS, ctx, KV_HEADS, HEAD_DIM});
+  v.v_full = rm(at(v_full, std::size_t(s) * full_stride() * es), v_full.dtype, {NUM_FULL_VISITS, ctx, KV_HEADS, HEAD_DIM});
+  v.conv_k = rm(at(conv_k, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
+  v.conv_v = rm(at(conv_v, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
+  v.conv_attn = rm(at(conv_attn, std::size_t(s) * conv_h_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, H});
+  v.conv_mlp = rm(at(conv_mlp, std::size_t(s) * conv_h_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, H});
+  v.length = 0;
+  return v;
+}
+
+BatchState make_batch_state(int slots, int ctx, bool kv_fp8) {
+  if (slots < 1 || slots > 4096) throw std::invalid_argument("slots must be in 1..4096");
+  if (ctx < 2 || ctx > (1 << 20)) throw std::invalid_argument("slot context must be in 2..2^20");
+  BatchState b;
+  b.slots = slots;
+  b.ctx = ctx;
+  b.kv_fp8 = kv_fp8;
+  b.ring_rows = std::min(ctx, WINDOW);
+  const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
+  b.k_ring = zeros(b.storage, DType::BF16, {slots * NUM_SLIDING_VISITS, b.ring_rows, KV_HEADS, HEAD_DIM});
+  b.v_ring = zeros(b.storage, DType::BF16, {slots * NUM_SLIDING_VISITS, b.ring_rows, KV_HEADS, HEAD_DIM});
+  b.ring_pos = zeros(b.storage, DType::I64, {slots * NUM_SLIDING_VISITS, b.ring_rows});
+  CUDA_CHECK(cudaMemset(b.ring_pos.data, 0xff, b.storage.back().bytes));  // -1
+  b.k_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, KV_HEADS, HEAD_DIM});
+  b.v_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, KV_HEADS, HEAD_DIM});
+  b.conv_k = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, KV_DIM});
+  b.conv_v = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, KV_DIM});
+  b.conv_attn = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, H});
+  b.conv_mlp = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, H});
+  return b;
+}
+
+void reset_slot(BatchState& st, int s, cudaStream_t stream) {
+  const State v = st.view(s);
+  CUDA_CHECK(cudaMemsetAsync(v.ring_pos.data, 0xff, std::size_t(st.kpos_stride()) * 8, stream));
+  CUDA_CHECK(cudaMemsetAsync(v.conv_k.data, 0, std::size_t(st.conv_kv_stride()) * 4, stream));
+  CUDA_CHECK(cudaMemsetAsync(v.conv_v.data, 0, std::size_t(st.conv_kv_stride()) * 4, stream));
+  CUDA_CHECK(cudaMemsetAsync(v.conv_attn.data, 0, std::size_t(st.conv_h_stride()) * 4, stream));
+  CUDA_CHECK(cudaMemsetAsync(v.conv_mlp.data, 0, std::size_t(st.conv_h_stride()) * 4, stream));
+}
+
+// ------------------------------------------------------------------------------------------------ decoder
+
+BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st, int max_seqs, cudaStream_t stream)
+    : w_(w), abl_(abl), st_(st), max_seqs_(max_seqs), stream_(stream), gemm_(std::make_unique<pk::Gemm>()) {
+  if (max_seqs < 1 || max_seqs > st.slots) throw std::invalid_argument("BatchDecoder: max_seqs must be in 1..slots");
+  const std::size_t N = std::size_t(max_seqs);
+  auto alloc = [&](std::size_t bytes) {
+    storage_.emplace_back(bytes);
+    return storage_.back().p;
+  };
+  auto f32 = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
+  auto bf16 = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
+  auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
+  auto i64 = [&](std::size_t n) { return static_cast<std::int64_t*>(alloc(n * 8)); };
+  tokens_ = i32(N), slots_ = i32(N), sampled_ = i32(N);
+  pos_ = i64(N), ids_ = i64(N);
+  B0_ = f32(N * H), B1_ = f32(N * H);
+  for (int p = 0; p < PASSES; ++p) B2_[p] = f32(N * H), E_[p] = f32(N * H);
+  hid_ = f32(N * H), part_ = f32(N * H), y_ = f32(N * H), y2_ = f32(N * H);
+  xin_ = bf16(3 * N * H), xm_ = bf16(N * H), xf_ = bf16(N * H);
+  mixf_ = f32(3 * N * H), msgs_ = f32(4 * N * H), mixm_ = f32(N * H);
+  proj16_ = bf16(N * PROJ_ROWS_FULL), proj32_ = f32(N * PROJ_ROWS_FULL);
+  attn_out_ = bf16(N * HEADS * HEAD_DIM), wo_out_ = bf16(N * H);
+  gin_ = bf16(3 * N * 2 * H), g16_ = bf16(N * GATE_RANK);
+  fpre_ = f32(N * H), gpre_ = f32(N * H);
+  router_logits_ = f32(N * EXPERTS), wts_ = f32(N * TOP_K);
+  idx_ = i32(N * TOP_K);
+  counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(N * TOP_K), pair_dst_ = i32(N * TOP_K);
+  tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_seqs)) * sizeof(int4)));
+  act_ = bf16(N * TOP_K * INTER), down_ = bf16(N * TOP_K * H), moe_sum_ = bf16(N * H);
+  logits_ = f32(N * LD_V);
+  // FP8 dense rows (dense_fp8): dequantized per visit as the Prefiller does
+  wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
+  for (auto& b : storage_) b.fill(0);
+  attn_ws_ = DeviceBuffer(attn::workspace_bytes(1, max_seqs));
+  attn_ws_.fill(0);  // the kernel resets its counters itself
+  sampled_host_.resize(N);
+}
+
+BatchDecoder::~BatchDecoder() = default;
+
+std::size_t BatchDecoder::device_bytes() const {
+  std::size_t n = attn_ws_.bytes;
+  for (const auto& b : storage_) n += b.bytes;
+  return n;
+}
+
+const float* const* BatchDecoder::block_table(const std::vector<const float*>& blocks) {
+  auto it = tables_.find(blocks);
+  if (it == tables_.end()) {
+    DeviceBuffer b(std::max<std::size_t>(blocks.size(), 1) * sizeof(void*));
+    if (!blocks.empty()) b.copy_from_host(blocks.data(), blocks.size() * sizeof(void*));
+    it = tables_.emplace(blocks, std::move(b)).first;
+  }
+  return static_cast<const float* const*>(it->second.p);
+}
+
+std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* tokens, const std::int32_t* slots,
+                                                 const std::int64_t* pos, float temperature, std::uint64_t seed) {
+  if (n < 1 || n > max_seqs_) throw std::invalid_argument("BatchDecoder::step: n outside 1..max_seqs");
+  for (int b = 0; b < n; ++b) {
+    if (slots[b] < 0 || slots[b] >= st_.slots) throw std::invalid_argument("BatchDecoder::step: slot out of range");
+    if (pos[b] < 0 || pos[b] >= st_.ctx) throw std::invalid_argument("BatchDecoder::step: position outside the slot context");
+  }
+  const Weights& w = w_;
+  const cudaStream_t s = stream_;
+  const int T = n;  // rows: one per sequence
+  const std::size_t slab = std::size_t(T) * H;
+  const float* attn_dirs = f32p(abl_.attn_dirs);
+  const float* attn_w = f32p(abl_.attn_w);
+  const float* mlp_dirs = f32p(abl_.mlp_dirs);
+  const float* mlp_w = f32p(abl_.mlp_w);
+  const State s0 = st_.view(0);  // per-visit base pointers; sequence b's slot adds slots[b] * stride
+
+  CUDA_CHECK(cudaMemcpyAsync(tokens_, tokens, std::size_t(n) * 4, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(slots_, slots, std::size_t(n) * 4, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(pos_, pos, std::size_t(n) * 8, cudaMemcpyHostToDevice, s));
+
+  auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
+                 const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
+                 __nv_bfloat16* out_bf16, float* out_f32) {
+    dense::MixParams p;
+    p.blocks = blocks.empty() ? nullptr : block_table(blocks);
+    p.nblocks = int(blocks.size());
+    p.base = base;
+    p.write = write;
+    p.abl_r = write ? abl_r : nullptr;
+    p.abl_d = write && abl_.detect ? abl_r + std::size_t(NUM_VISITS) * H : nullptr;
+    p.abl_w = write ? abl_w : nullptr;
+    p.partial_out = partial_out;
+    p.queries = queries;
+    p.Q = Q;
+    p.norm_w = norm_w;
+    p.out_bf16 = out_bf16;
+    p.out_f32 = out_f32;
+    p.M = T;
+    dense::mix(p, false, s);
+  };
+  // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 rows dequantized (weights.dequant)
+  auto bf16_rows = [&](const Dense& d) -> const __nv_bfloat16* {
+    if (!d.fp8()) return bf16p(d.w);
+    dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
+    return wscratch_;
+  };
+  auto gates = [&](const pk::GateRows& rows, int G, const Tensor& down, const Tensor& forget16, const Tensor& gain16,
+                   const float* norm_w, __nv_bfloat16* out) {
+    pk::gate_inputs(rows, G, T, gin_, s);
+    for (int g = 0; g < G; ++g) {
+      const __nv_bfloat16* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
+      gemm_->run(gin_ + std::size_t(g) * T * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, T, GATE_RANK, 2 * H, s);
+      gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, T, H,
+                 GATE_RANK, s);
+      gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, T, H,
+                 GATE_RANK, s);
+      pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, T, out + std::size_t(g) * slab,
+                     s);
+    }
+  };
+
+  pk::widen_ids(tokens_, T, ids_, IMAGE_PLACEHOLDER_ID, s);
+  dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  int prev_v = -1;
+
+  for (int v = 0; v < NUM_VISITS; ++v) {
+    const int l = VISITS[v].layer, p = VISITS[v].pass;
+    const Layer& layer = w.layers[l];
+    const bool msgs = is_loop_layer(l) && p > 0;
+    const bool boundary = l % BLOCK == 0;
+    const std::vector<const float*> blocks = blocks_of(l, p, B0_, B1_, B2_, E_);
+
+    // ---- hidden entering this visit (the previous MLP write applied), stored where it is a block
+    float* hid;
+    const float* base;
+    const float* write;
+    if (v == 0) {
+      hid = B0_, base = B0_, write = nullptr;
+    } else if (l == LOOP_START && p > 0) {
+      hid = B1_, base = B1_, write = nullptr;
+    } else {
+      hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == 18 ? E_[2] : hid_;
+      base = part_, write = y2_;
+    }
+    const int pv = prev_v >= 0 ? prev_v : 0;
+    const float* r_prev = mlp_dirs + std::size_t(pv) * H;
+    const float* w_prev = mlp_w + 4 * std::size_t(pv);
+    if (msgs) {
+      const int i = l - LOOP_START;
+      const float* src_base = i == 0 ? part_ : E_[p - 1];
+      const float* src_write = i == 0 ? y2_ : nullptr;
+      mix({B2_[p - 1]}, src_base, src_write, r_prev, w_prev, i == 0 ? E_[p - 1] : nullptr,
+          f32p(w.message_queries) + std::size_t(i) * 4 * H, 4, nullptr, nullptr, msgs_);
+      if (i == 0) write = nullptr;
+    }
+    // ---- attention read(s)
+    const float* queries = layer.attn_query.data ? f32p(layer.attn_query) : nullptr;
+    const int nq = layer.attn_query.data ? layer.attn_query.ne[1] : 1;
+    float* partial_out = hid != base ? hid : nullptr;
+    if (msgs) {
+      mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
+      pk::GateRows rows;
+      for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
+      gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3), xin_);
+    } else {
+      mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
+          f32p(layer.attn_norm_mix), xin_, nullptr);
+    }
+
+    // ---- projections (fast.proj_layout): one GEMM for a single input, else per input segment; BF16-rounded,
+    // then the FP32 rows the decode attention kernel reads
+    const int R = proj_rows(layer.full);
+    const __nv_bfloat16* wp = bf16_rows(layer.wproj);
+    const bool single = !layer.full && !msgs;
+    if (single) {
+      gemm_->run(xin_, H, wp, H, proj16_, R, false, T, R, H, s);
+    } else {
+      struct Part {
+        int begin, end, input;
+      };
+      const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
+                            {SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], 1},
+                            {SEG_BEGIN[SEG_V], SEG_BEGIN[SEG_K_DYN], 2},
+                            {SEG_BEGIN[SEG_K_DYN], SEG_BEGIN[SEG_V_DYN], 1},
+                            {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
+      for (const Part& part : parts) {
+        if (part.begin >= R) break;
+        gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H, proj16_ + part.begin,
+                   R, false, T, part.end - part.begin, H, s);
+      }
+    }
+    kb::widen(proj16_, R, T, R, proj32_, R, s);
+
+    // ---- attention: every sequence over its own slot
+    attn::DecodeArgs a;
+    a.proj = proj32_;
+    a.M = 1;
+    a.q_scale = f32p(layer.q_scale);
+    a.r_scale = f32p(layer.r_scale);
+    a.rel_proj = f32p(layer.rel_proj);
+    a.conv_k_state = s0.conv_k_at(v);
+    a.conv_v_state = s0.conv_v_at(v);
+    a.pos = pos_;
+    a.workspace = attn_ws_.p;
+    a.workspace_size = attn_ws_.bytes;
+    a.out = attn_out_;
+    a.batch = T;
+    a.slots = slots_;
+    a.conv_stride = st_.conv_kv_stride();
+    if (layer.full) {
+      const int fi = FULL_INDEX[v];
+      a.k_conv = f32p(layer.k_static);
+      a.v_conv = f32p(layer.v_static);
+      a.k_cache = s0.k_full_at(fi).data;
+      a.v_cache = s0.v_full_at(fi).data;
+      a.cache_fp8 = st_.kv_fp8;
+      a.cache_rows = st_.ctx;
+      a.kpos = nullptr;
+      a.window = 0;
+      a.log_scaling = true;
+      a.cache_stride = st_.full_stride();
+    } else {
+      const int ri = RING_INDEX[v];
+      a.k_conv = f32p(layer.k_conv);
+      a.v_conv = f32p(layer.v_conv);
+      a.k_cache = s0.k_ring_at(ri).data;
+      a.v_cache = s0.v_ring_at(ri).data;
+      a.cache_fp8 = false;
+      a.cache_rows = st_.ring_rows;
+      a.kpos = s0.ring_pos_at(ri);
+      a.window = WINDOW;
+      a.log_scaling = false;
+      a.cache_stride = st_.ring_stride();
+      a.kpos_stride = st_.kpos_stride();
+    }
+    attn::attn_decode(a, s);
+
+    // ---- output projection + post-attention conv (each slot's state)
+    gemm_->run(attn_out_, HEADS * HEAD_DIM, bf16_rows(layer.wo), HEADS * HEAD_DIM, wo_out_, H, false, T, H,
+               HEADS * HEAD_DIM, s);
+    kb::conv(wo_out_, H, T, 1, H, f32p(layer.attn_conv), s0.conv_attn_at(v), st_.conv_h_stride(), slots_, y_, s);
+
+    // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
+    std::vector<const float*> mlp_blocks = blocks;
+    if (boundary) mlp_blocks.push_back(hid);
+    const float* mbase = boundary ? nullptr : hid;
+    if (msgs) {
+      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+          f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_);
+      pk::GateRows rows;
+      rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
+      gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1), xm_);
+    } else {
+      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+          f32p(layer.mlp_query), 1, f32p(layer.mlp_norm1), xm_, nullptr);
+    }
+
+    // ---- routed experts (model._moe_grouped) + post-MLP conv (each slot's state)
+    gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
+    CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
+    pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
+    const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
+    pk::moe_route(idx_, T, work, s);
+    const Experts& ex = layer.experts;
+    const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
+                            f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+    pk::moe_gate_up(me, xm_, T, work, act_, s);
+    pk::moe_down(me, act_, T, work, down_, s);
+    pk::moe_combine(down_, wts_, T, moe_sum_, s);
+    kb::conv(moe_sum_, H, T, 1, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, y2_, s);
+    prev_v = v;
+  }
+
+  // ---- final read, the head of every row, one token per row
+  mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
+      f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
+  if (w.unembed.fp8()) {  // model.logits row by row (FP8 rows dequantized in the kernel)
+    for (int b = 0; b < T; ++b)
+      pk::head_logits(xf_ + std::size_t(b) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB,
+                      logits_ + std::size_t(b) * LD_V, s);
+  } else {
+    gemm_->run(xf_, H, bf16p(w.unembed.w), H, logits_, LD_V, true, T, UNPADDED_VOCAB, H, s);
+  }
+  kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, logits_raw(), temperature, seed, sampled_, s);
+  CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled_, std::size_t(n) * 4, cudaMemcpyDeviceToHost, s));
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  return {sampled_host_.data(), std::size_t(n)};
+}
+
+}  // namespace ingine::model
