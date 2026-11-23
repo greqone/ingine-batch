@@ -102,10 +102,13 @@ class BatchDecoder {
   int max_seqs() const { return max_seqs_; }
   int max_m() const { return max_m_; }
   std::size_t device_bytes() const;
-  // the last step's logits (device fp32, row b at b * kLogitsLd): head outputs l when logits_raw()
-  // (model.logits = 30 tanh(bf16(l) / 30)), else model.logits
+  // With BF16 head rows the step picks its tokens in the head GEMM (kernels::batch::head_sample) and stores the
+  // logits only after keep_logits(true) (allocates them: rows x kLogitsLd fp32); FP8 head rows always store them.
+  void keep_logits(bool keep);
+  // the last step's logits (device fp32, row b at b * kLogitsLd; nullptr when not kept): head outputs l when
+  // logits_raw() (model.logits = 30 tanh(bf16(l) / 30)), else model.logits
   static constexpr int kLogitsLd = (UNPADDED_VOCAB + 7) / 8 * 8;
-  const float* logits() const { return logits_; }
+  const float* logits() const { return keep_logits_ || !logits_raw() ? logits_ : nullptr; }
   bool logits_raw() const { return !w_.unembed.fp8(); }
 
  private:
@@ -146,7 +149,10 @@ class BatchDecoder {
   int *counts_, *tiles_n_, *pair_token_, *pair_dst_;
   int4* tiles_;
   __nv_bfloat16 *act_, *down_, *moe_sum_;
-  float* logits_;
+  float* logits_ = nullptr;
+  bool keep_logits_ = false;
+  DeviceBuffer logits_buf_;  // logits_ when kept (BF16 head rows)
+  int2* head_partials_ = nullptr;  // kernels::batch::head_sample's
   __nv_bfloat16* wscratch_;
   // speculative verify (max_m > 1): taps, conv inputs per visit, conv rows the step overwrites, accepted rows
   __nv_bfloat16* taps_ = nullptr;

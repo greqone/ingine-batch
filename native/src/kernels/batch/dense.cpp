@@ -22,11 +22,9 @@ void cuda_check(cudaError_t e, const char* what) {
 
 }  // namespace
 
-// a cuBLASLt algorithm, or mma_gemm's config cfg
+// a cuBLASLt algorithm
 struct TunedGemm::Cand {
-  bool mma = false;
   cublasLtMatmulAlgo_t algo{};
-  int cfg = 0;
 };
 
 // one algorithm group: the candidates and their timings
@@ -45,8 +43,8 @@ struct TunedGemm::Plan {
   cublasLtMatmulDesc_t op = nullptr;
   cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
   Group* group = nullptr;
-  std::vector<bool> valid;  // per candidate (cublasLtMatmulAlgoCheck / mma_gemm's shape limits)
-  int best = -1, best_version = -1, first_cublas = -1;
+  std::vector<bool> valid;  // per candidate (cublasLtMatmulAlgoCheck)
+  int best = -1, best_version = -1, first = -1;  // first: the first valid
   ~Plan() {
     if (la) cublasLtMatrixLayoutDestroy(la);
     if (lb) cublasLtMatrixLayoutDestroy(lb);
@@ -116,19 +114,14 @@ TunedGemm::Plan& TunedGemm::plan(const Key& key) {
     make_layouts(M, N, K, lda, ldb, ldc, c_fp32, count, sa, sb, sc, p->la, p->lb, p->lc);
     p->group = &group(key, *p);
     for (const Cand& c : p->group->cands) {
-      bool ok;
-      if (c.mma) {
-        ok = count == 1 && K % 64 == 0 && lda % 8 == 0 && ldb % 8 == 0 && N % 2 == 0 && ldc % 2 == 0;
-      } else {
-        cublasLtMatmulHeuristicResult_t r{};
-        ok = cublasLtMatmulAlgoCheck(handle_, p->op, p->la, p->lb, p->lc, p->lc, &c.algo, &r) ==
-                 CUBLAS_STATUS_SUCCESS &&
-             r.workspaceSize <= kWorkspaceBytes;
-        if (ok && p->first_cublas < 0) p->first_cublas = int(p->valid.size());
-      }
+      cublasLtMatmulHeuristicResult_t r{};
+      const bool ok = cublasLtMatmulAlgoCheck(handle_, p->op, p->la, p->lb, p->lc, p->lc, &c.algo, &r) ==
+                          CUBLAS_STATUS_SUCCESS &&
+                      r.workspaceSize <= kWorkspaceBytes;
+      if (ok && p->first < 0) p->first = int(p->valid.size());
       p->valid.push_back(ok);
     }
-    if (p->first_cublas < 0) throw std::runtime_error("batch TunedGemm: no valid cuBLASLt algorithm");
+    if (p->first < 0) throw std::runtime_error("batch TunedGemm: no valid cuBLASLt algorithm");
   } catch (...) {
     delete p;
     throw;
@@ -169,8 +162,7 @@ int TunedGemm::configurable(bool c_fp32) {
 // The heuristic's candidates at bucket(M), with the plan's descriptors otherwise (strides of whole M-row
 // matrices scaled to the bucket's M); the configurable family's 64x64, 128x64, 128x128 and 256x64 tiles (weight
 // rows x activation rows), split to fill the GPU once when unsplit they leave half of it idle, each with the first
-// stage count of a fixed preference that it supports. The head (N >= kMmaMinN, a call per step at milliseconds
-// each): the heuristic's first kHeadCandidates and mma_gemm's.
+// stage count of a fixed preference that it supports.
 TunedGemm::Group& TunedGemm::group(const Key& key, const Plan& p) {
   auto [M, N, K, lda, ldb, ldc, c_fp32, count, sa, sb, sc] = key;
   const int Mb = bucket(M);
@@ -178,9 +170,7 @@ TunedGemm::Group& TunedGemm::group(const Key& key, const Plan& p) {
   if (auto it = groups_.find(gkey); it != groups_.end()) return *it->second;
   cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
   cublasLtMatmulPreference_t pref = nullptr;
-  const bool head = N >= kMmaMinN;
-  const int want = head ? kHeadCandidates : kCandidates;
-  std::vector<cublasLtMatmulHeuristicResult_t> results(static_cast<std::size_t>(want));
+  std::vector<cublasLtMatmulHeuristicResult_t> results(kCandidates);
   int found = 0;
   cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
   auto scaled = [&](std::int64_t s, int ld) { return s == std::int64_t(M) * ld ? std::int64_t(Mb) * ld : s; };
@@ -195,13 +185,13 @@ TunedGemm::Group& TunedGemm::group(const Key& key, const Plan& p) {
       st = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &reduction,
                                                 sizeof(reduction));
     if (st == CUBLAS_STATUS_SUCCESS)
-      st = cublasLtMatmulAlgoGetHeuristic(handle_, p.op, la, lb, lc, lc, pref, want, results.data(), &found);
+      st = cublasLtMatmulAlgoGetHeuristic(handle_, p.op, la, lb, lc, lc, pref, kCandidates, results.data(), &found);
   } catch (...) {
     st = CUBLAS_STATUS_INTERNAL_ERROR;
   }
   auto* g = new Group;
-  for (int i = 0; i < found; ++i) g->cands.push_back({false, results[std::size_t(i)].algo});
-  if (const int id = st == CUBLAS_STATUS_SUCCESS && !head ? configurable(c_fp32) : -1; id >= 0) {
+  for (int i = 0; i < found; ++i) g->cands.push_back({results[std::size_t(i)].algo});
+  if (const int id = st == CUBLAS_STATUS_SUCCESS ? configurable(c_fp32) : -1; id >= 0) {
     const cudaDataType_t ct = c_fp32 ? CUDA_R_32F : CUDA_R_16BF;
     struct Tile {
       int id, rows_b, rows_a;
@@ -225,7 +215,7 @@ TunedGemm::Group& TunedGemm::group(const Key& key, const Plan& p) {
         cublasLtMatmulHeuristicResult_t r{};
         if (cublasLtMatmulAlgoCheck(handle_, p.op, la, lb, lc, lc, &a, &r) == CUBLAS_STATUS_SUCCESS &&
             r.workspaceSize <= kWorkspaceBytes) {
-          g->cands.push_back({false, a});
+          g->cands.push_back({a});
           break;
         }
       }
@@ -240,8 +230,6 @@ TunedGemm::Group& TunedGemm::group(const Key& key, const Plan& p) {
     check(st, "heuristic");
     throw std::runtime_error("batch TunedGemm: no cuBLASLt algorithm");
   }
-  if (head)
-    for (int cfg = 0; cfg < kMmaConfigs; ++cfg) g->cands.push_back({true, {}, cfg});
   const std::size_t n = g->cands.size();
   g->best.assign(n, 0.0);
   g->timed.assign(n, 0);
@@ -258,9 +246,7 @@ void TunedGemm::run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int
   Plan& p = plan(Key{M, N, K, lda, ldb, ldc, c_fp32, bs.count, bs.a, bs.b, bs.c});
   Group& g = *p.group;
   const int n = int(g.cands.size());
-  const bool aligned = reinterpret_cast<std::uintptr_t>(A) % 16 == 0 && reinterpret_cast<std::uintptr_t>(B) % 16 == 0 &&
-                       reinterpret_cast<std::uintptr_t>(C) % 8 == 0;
-  auto ok = [&](int i) { return p.valid[i] && (aligned || !g.cands[i].mma); };
+  auto ok = [&](int i) { return bool(p.valid[i]); };
   if (!g.used) g.used = true, used_.push_back(&g);
   // a candidate still to time (fewest runs first; once the group ran in kWarmSteps steps), else the fastest measured
   int cand = -1;
@@ -277,7 +263,7 @@ void TunedGemm::run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int
         if (p.valid[i] && g.timed[i] > 0 && (p.best < 0 || g.best[i] < g.best[p.best])) p.best = i;
       p.best_version = g.version;
     }
-    cand = p.best >= 0 && ok(p.best) ? p.best : p.first_cublas;  // no timings yet: the heuristic's first
+    cand = p.best >= 0 ? p.best : p.first;  // no timings yet: the heuristic's first
   }
   Timing t{&g, cand, nullptr, nullptr};
   if (timed) {
@@ -292,15 +278,10 @@ void TunedGemm::run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int
     pending_.push_back(t);
     cuda_check(cudaEventRecord(t.start, stream), "event record");
   }
-  const Cand& c = g.cands[cand];
-  if (c.mma) {
-    mma_gemm(c.cfg, A, lda, B, ldb, C, ldc, c_fp32, M, N, K, stream);
-  } else {
-    const float alpha = 1.f, beta = 0.f;
-    check(cublasLtMatmul(handle_, p.op, &alpha, B, p.la, A, p.lb, &beta, C, p.lc, C, p.lc, &c.algo, workspace_,
-                         kWorkspaceBytes, stream),
-          "matmul");
-  }
+  const float alpha = 1.f, beta = 0.f;
+  check(cublasLtMatmul(handle_, p.op, &alpha, B, p.la, A, p.lb, &beta, C, p.lc, C, p.lc, &g.cands[cand].algo,
+                       workspace_, kWorkspaceBytes, stream),
+        "matmul");
   if (timed) cuda_check(cudaEventRecord(t.stop, stream), "event record");
 }
 

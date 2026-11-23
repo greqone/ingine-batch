@@ -24,28 +24,31 @@ struct Strided {
   std::int64_t a = 0, b = 0, c = 0;
 };
 
-// The step's own BF16 GEMM (mma.m16n8k16, FP32 accumulation), TunedGemm's candidates for the head besides
-// cuBLASLt's: C = A . B^T as TunedGemm::run (one product), CTA tiles of 64 x 128, 64 x 64 or 32 x 128 (cfg 0, 1, 2;
-// rows of A x rows of B), K in 64-element stages, the first weight stages loaded before the wait for the previous
-// kernel (programmatic dependent launch). Requires K % 64 == 0, lda and ldb multiples of 8, N and ldc even, A and B
-// 16-byte aligned, C 8-byte aligned.
-inline constexpr int kMmaConfigs = 3;
-void mma_gemm(int cfg, const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, void* C, int ldc, bool c_fp32,
-              int M, int N, int K, cudaStream_t stream);
+// The head with kernels::batch::sample's token choice fused (raw logits): L[M, N] = A[M, K] . B[N, K]^T (BF16,
+// mma.m16n8k16, FP32 accumulation; CTA tiles of 64 or, up to 32 rows, 32 rows of A x 128 rows of B, K in 64-element
+// stages, the first weight stages loaded before the wait for the previous kernel: programmatic dependent launch),
+// stored to logits (row stride ldc) unless nullptr; out[r] = argmax over v < N of key_v (ties to the lowest v),
+// key_v = s_v = 30 tanh(bf16(L[r, v]) / 30) where temps[r] <= 0, else s_v / temps[r] + G(seed, r, v) as sample
+// computes it: the same token as sample over the stored logits. Each CTA writes its rows' best (key, v) to
+// partials (head_partials(M, N) elements), a second kernel picks per row. temps: device fp32 [M]; out: device int32
+// [M]. Requires K % 64 == 0, lda and ldb multiples of 8, N (and ldc) even, A, B 16-byte and logits 8-byte aligned.
+std::size_t head_partials(int M, int N);
+void head_sample(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, int M, int N, int K,
+                 const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
+                 cudaStream_t stream);
 
 // BF16 GEMM, the arithmetic of prefill::Gemm: C[M, N] (row-major, ldc) = A[M, K] (bf16, lda) . B[N, K]^T (bf16,
 // ldb), FP32 accumulation, split-K partials reduced in FP32 only; C is bf16 (rounded once) or fp32.
 // The algorithm is chosen by measurement in place. Shapes are grouped by bucket(M); a group's candidates are the
-// cuBLASLt heuristic's first kCandidates at the bucket's M and configurations of cuBLASLt's configurable kernels, or
-// for N >= kMmaMinN (the head) the heuristic's first kHeadCandidates and the mma_gemm configs (see group()).
-// A group that has run in kWarmSteps steps (collect() calls; shapes that come and go, as the prefill's, keep the
-// heuristic's first) and has candidates with fewer than kSamples timings runs them in turn between CUDA events, and
-// collect() (after the stream synchronised) adds the timings; a candidate slower than kDrop times the group's
-// fastest (twice, after a single timing) stops being run. Every other call runs the group's fastest candidate
-// (least time measured). Descriptors and validity are cached per exact shape.
+// cuBLASLt heuristic's first kCandidates at the bucket's M and configurations of cuBLASLt's configurable kernels
+// (see group()). A group that has run in kWarmSteps steps (collect() calls; shapes that come and go, as the
+// prefill's, keep the heuristic's first) and has candidates with fewer than kSamples timings runs them in turn
+// between CUDA events, and collect() (after the stream synchronised) adds the timings; a candidate slower than
+// kDrop times the group's fastest (twice, after a single timing) stops being run. Every other call runs the group's
+// fastest candidate (least time measured). Descriptors and validity are cached per exact shape.
 class TunedGemm {
  public:
-  static constexpr int kCandidates = 6, kHeadCandidates = 2, kSamples = 2, kWarmSteps = 8, kMmaMinN = 65536;
+  static constexpr int kCandidates = 6, kSamples = 2, kWarmSteps = 8;
   static constexpr float kDrop = 1.25f;
   static constexpr std::size_t kWorkspaceBytes = std::size_t(32) << 20;
 

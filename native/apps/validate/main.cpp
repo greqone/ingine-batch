@@ -204,6 +204,7 @@ void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cas
     BatchState st = make_batch_state(n, ctx, opt.kv_fp8);
     Prefiller prefiller(w, abl, opt.prefill_chunk, stream);
     BatchDecoder dec(w, abl, st, n, stream, width);
+    dec.keep_logits(true);  // compared against the goldens
     DeviceBuffer tokens(std::size_t(opt.prefill_chunk) * 4), logits(std::size_t(UNPADDED_VOCAB) * 4);
     std::vector<float> host(UNPADDED_VOCAB);
     auto fetch = [&](const float* d, bool raw) {

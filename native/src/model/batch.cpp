@@ -144,7 +144,9 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(N * TOP_K), pair_dst_ = i32(N * TOP_K);
   tiles_ = static_cast<int4*>(alloc(std::size_t(kb::moe_tiles_capacity(int(N))) * sizeof(int4)));
   act_ = bf16(N * TOP_K * INTER), down_ = bf16(N * TOP_K * H), moe_sum_ = bf16(N * H);
-  logits_ = f32(N * LD_V);
+  // BF16 head rows: the tokens from the head GEMM, the logits only when kept; FP8 rows: the logits, then sample
+  if (w.unembed.fp8()) logits_ = f32(N * LD_V);
+  else head_partials_ = static_cast<int2*>(alloc(kb::head_partials(int(N), UNPADDED_VOCAB) * sizeof(int2)));
   // FP8 dense rows (dense_fp8): dequantized per visit as the Prefiller does
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   if (max_m > 1) {
@@ -183,9 +185,17 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
 BatchDecoder::~BatchDecoder() = default;
 
 std::size_t BatchDecoder::device_bytes() const {
-  std::size_t n = attn_ws_.bytes;
+  std::size_t n = attn_ws_.bytes + logits_buf_.bytes;
   for (const auto& b : storage_) n += b.bytes;
   return n;
+}
+
+void BatchDecoder::keep_logits(bool keep) {
+  keep_logits_ = keep;
+  if (keep && !logits_) {
+    logits_buf_ = DeviceBuffer(std::size_t(max_seqs_) * max_m_ * LD_V * sizeof(float));
+    logits_ = static_cast<float*>(logits_buf_.p);
+  }
 }
 
 const float* const* BatchDecoder::block_table(const std::vector<const float*>& blocks) {
@@ -458,10 +468,11 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
     for (int b = 0; b < T; ++b)
       pk::head_logits(xf_ + std::size_t(b) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB,
                       logits_ + std::size_t(b) * LD_V, s);
-  } else {
-    gemm_->run(xf_, H, bf16p(w.unembed.w), H, logits_, LD_V, true, T, UNPADDED_VOCAB, H, s);
+    kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, false, temps_, seed, sampled_, s);
+  } else {  // the head with kb::sample's choice fused
+    kb::head_sample(xf_, H, bf16p(w.unembed.w), H, T, UNPADDED_VOCAB, H, temps_, seed, keep_logits_ ? logits_ : nullptr,
+                    LD_V, head_partials_, sampled_, s);
   }
-  kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, logits_raw(), temps_, seed, sampled_, s);
   CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled_, std::size_t(T) * 4, cudaMemcpyDeviceToHost, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
   gemm_->collect();
