@@ -231,7 +231,9 @@ __device__ __forceinline__ void block_sum(float (&v)[N]) {
 
 __device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 
-__global__ void __launch_bounds__(ROW_T) gate_inputs_kernel(const GateRows rows, int T, uint16_t* __restrict__ gin) {
+// rows indexed in parameter space (__grid_constant__: no local copy of the struct)
+__global__ void __launch_bounds__(ROW_T)
+    gate_inputs_kernel(const __grid_constant__ GateRows rows, int T, uint16_t* __restrict__ gin) {
   const int t = blockIdx.x, g = blockIdx.y, c = threadIdx.x * 4;
   const float4 h = *reinterpret_cast<const float4*>(rows.h[g] + size_t(t) * H + c);
   const float4 m = *reinterpret_cast<const float4*>(rows.msg[g] + size_t(t) * H + c);

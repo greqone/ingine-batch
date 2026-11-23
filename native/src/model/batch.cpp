@@ -8,6 +8,7 @@
 #include "ingine/generator.h"
 #include "kernels/attn/attn.h"
 #include "kernels/batch/batch.h"
+#include "kernels/batch/dense.h"
 #include "kernels/batch/moe.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
@@ -114,7 +115,7 @@ void reset_slot(BatchState& st, int s, cudaStream_t stream) {
 BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st, int max_seqs, cudaStream_t stream,
                            int max_m)
     : w_(w), abl_(abl), st_(st), max_seqs_(max_seqs), max_m_(max_m), stream_(stream),
-      gemm_(std::make_unique<pk::Gemm>()) {
+      gemm_(std::make_unique<kb::TunedGemm>()) {
   if (max_seqs < 1 || max_seqs > st.slots) throw std::invalid_argument("BatchDecoder: max_seqs must be in 1..slots");
   if (max_m < 1 || max_m > 8) throw std::invalid_argument("BatchDecoder: max_m must be in 1..8");
   const std::size_t S = std::size_t(max_seqs), N = S * std::size_t(max_m);  // sequences, rows
@@ -136,8 +137,8 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   mixf_ = f32(3 * N * H), msgs_ = f32(4 * N * H), mixm_ = f32(N * H);
   proj16_ = bf16(N * PROJ_ROWS_FULL), proj32_ = f32(N * PROJ_ROWS_FULL);
   attn_out_ = bf16(N * HEADS * HEAD_DIM), wo_out_ = bf16(N * H);
-  gin_ = bf16(3 * N * 2 * H), g16_ = bf16(N * GATE_RANK);
-  fpre_ = f32(N * H), gpre_ = f32(N * H);
+  gin_ = bf16(3 * N * 2 * H), g16_ = bf16(3 * N * GATE_RANK);
+  fg_ = f32(3 * N * 2 * H);
   router_logits_ = f32(N * EXPERTS), wts_ = f32(N * TOP_K);
   idx_ = i32(N * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(N * TOP_K), pair_dst_ = i32(N * TOP_K);
@@ -154,6 +155,25 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
     commit_ = i32(S);
   }
   for (auto& b : storage_) b.fill(0);
+  // the gates' forget16 | gain16 rows per gate (one GEMM of N = 2H per gate), after the weights' uploads
+  CUDA_CHECK(cudaDeviceSynchronize());
+  const std::size_t gate_elems = std::size_t(H) * GATE_RANK;
+  auto* fg_rows = bf16(std::size_t(LOOP_END - LOOP_START) * 4 * 2 * gate_elems);
+  for (int l = LOOP_START; l < LOOP_END; ++l) {
+    const Layer& layer = w.layers[l];
+    __nv_bfloat16* dst = fg_rows + std::size_t(l - LOOP_START) * 4 * 2 * gate_elems;
+    fg_qkv_[l] = dst, fg_mlp_[l] = dst + 3 * 2 * gate_elems;
+    const std::pair<const Tensor*, const Tensor*> stacks[] = {{&layer.qkv_gate_forget16, &layer.qkv_gate_gain16},
+                                                             {&layer.mlp1_gate_forget16, &layer.mlp1_gate_gain16}};
+    for (int s = 0; s < 2; ++s) {
+      const int G = s == 0 ? 3 : 1;
+      __nv_bfloat16* d = dst + (s == 0 ? 0 : 3 * 2 * gate_elems);
+      for (int half = 0; half < 2; ++half)
+        CUDA_CHECK(cudaMemcpy2D(d + half * gate_elems, 2 * gate_elems * 2,
+                                half == 0 ? stacks[s].first->data : stacks[s].second->data, gate_elems * 2,
+                                gate_elems * 2, G, cudaMemcpyDeviceToDevice));
+    }
+  }
   attn_ws_ = DeviceBuffer(attn::workspace_bytes(max_m, max_seqs));
   attn_ws_.fill(0);  // the kernel resets its counters itself
   sampled_host_.resize(N);
@@ -248,19 +268,16 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
     dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
     return wscratch_;
   };
-  auto gates = [&](const pk::GateRows& rows, int G, const Tensor& down, const Tensor& forget16, const Tensor& gain16,
+  // G gates at once: the down projections as one strided GEMM, then forget | gain (fg rows, N = 2H) as one
+  auto gates = [&](const pk::GateRows& rows, int G, const Tensor& down, const __nv_bfloat16* fg_rows,
                    const float* norm_w, __nv_bfloat16* out) {
     pk::gate_inputs(rows, G, T, gin_, s);
-    for (int g = 0; g < G; ++g) {
-      const __nv_bfloat16* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
-      gemm_->run(gin_ + std::size_t(g) * T * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, T, GATE_RANK, 2 * H, s);
-      gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, T, H,
-                 GATE_RANK, s);
-      gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, T, H,
-                 GATE_RANK, s);
-      pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, T, out + std::size_t(g) * slab,
-                     s);
-    }
+    const std::int64_t TG = std::int64_t(T) * GATE_RANK;
+    gemm_->run(gin_, 2 * H, bf16p(down), 2 * H, g16_, GATE_RANK, false, T, GATE_RANK, 2 * H, s,
+               {G, std::int64_t(T) * 2 * H, std::int64_t(GATE_RANK) * 2 * H, TG});
+    gemm_->run(g16_, GATE_RANK, fg_rows, GATE_RANK, fg_, 2 * H, true, T, 2 * H, GATE_RANK, s,
+               {G, TG, std::int64_t(2) * H * GATE_RANK, std::int64_t(T) * 2 * H});
+    kb::gate_apply(rows, G, fg_, T, norm_w, out, slab, s);
   };
 
   pk::widen_ids(tokens_, T, ids_, IMAGE_PLACEHOLDER_ID, s);
@@ -305,7 +322,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
       mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
       pk::GateRows rows;
       for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
-      gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3), xin_);
+      gates(rows, 3, layer.qkv_gate_down, fg_qkv_[l], f32p(layer.attn_norm3), xin_);
     } else {
       mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
           f32p(layer.attn_norm_mix), xin_, nullptr);
@@ -315,26 +332,24 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
       ++tap;
     }
 
-    // ---- projections (fast.proj_layout): one GEMM for a single input, else per input segment; BF16-rounded,
-    // then the FP32 rows the decode attention kernel reads
+    // ---- projections (fast.proj_layout): one GEMM for a single input, else q | gate | rel | sink from input 0,
+    // then k, v (inputs 1, 2) as one strided GEMM, then k_dyn, v_dyn likewise; BF16-rounded, then the FP32 rows the
+    // decode attention kernel reads
     const int R = proj_rows(layer.full);
     const __nv_bfloat16* wp = bf16_rows(layer.wproj);
     const bool single = !layer.full && !msgs;
     if (single) {
       gemm_->run(xin_, H, wp, H, proj16_, R, false, T, R, H, s);
     } else {
-      struct Part {
-        int begin, end, input;
-      };
-      const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
-                            {SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], 1},
-                            {SEG_BEGIN[SEG_V], SEG_BEGIN[SEG_K_DYN], 2},
-                            {SEG_BEGIN[SEG_K_DYN], SEG_BEGIN[SEG_V_DYN], 1},
-                            {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
-      for (const Part& part : parts) {
-        if (part.begin >= R) break;
-        gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H, proj16_ + part.begin,
-                   R, false, T, part.end - part.begin, H, s);
+      static_assert(SEG_INPUT[SEG_Q] == 0 && SEG_INPUT[SEG_SINK] == 0 && SEG_INPUT[SEG_K] == 1 &&
+                    SEG_INPUT[SEG_V] == 2 && SEG_INPUT[SEG_K_DYN] == 1 && SEG_INPUT[SEG_V_DYN] == 2);
+      static_assert(SEG_ROWS[SEG_K] == SEG_ROWS[SEG_V] && SEG_ROWS[SEG_K_DYN] == SEG_ROWS[SEG_V_DYN]);
+      gemm_->run(xin_, H, wp, H, proj16_, R, false, T, SEG_BEGIN[SEG_K], H, s);
+      for (const int seg : {SEG_K, SEG_K_DYN}) {
+        if (SEG_BEGIN[seg] >= R) break;
+        const int rows = SEG_ROWS[seg];
+        gemm_->run(xin_ + slab, H, wp + std::size_t(SEG_BEGIN[seg]) * H, H, proj16_ + SEG_BEGIN[seg], R, false, T,
+                   rows, H, s, {2, std::int64_t(slab), std::int64_t(rows) * H, rows});
       }
     }
     kb::widen(proj16_, R, T, R, proj32_, R, s);
@@ -401,7 +416,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
           f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_);
       pk::GateRows rows;
       rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
-      gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1), xm_);
+      gates(rows, 1, layer.mlp1_gate_down, fg_mlp_[l], f32p(layer.mlp_norm1), xm_);
     } else {
       mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
           f32p(layer.mlp_query), 1, f32p(layer.mlp_norm1), xm_, nullptr);
@@ -438,6 +453,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
   kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, logits_raw(), temps_, seed, sampled_, s);
   CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled_, std::size_t(T) * 4, cudaMemcpyDeviceToHost, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
+  gemm_->collect();
   return {sampled_host_.data(), std::size_t(T)};
 }
 

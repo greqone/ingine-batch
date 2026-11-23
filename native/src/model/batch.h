@@ -15,8 +15,8 @@
 #include <span>
 #include <vector>
 
-namespace ingine::kernels::prefill {
-class Gemm;
+namespace ingine::kernels::batch {
+class TunedGemm;
 }
 
 namespace ingine::model {
@@ -53,10 +53,10 @@ void reset_slot(BatchState& st, int s, cudaStream_t stream);
 // One decode step for n sequences of M consecutive rows each (M = 1: plain decoding; M > 1: a speculative verify
 // of the anchor and M - 1 drafts): rows b*M .. b*M+M-1 are tokens at positions pos[b] .. pos[b]+M-1 of slot
 // slots[b]. The visit sequence is the Prefiller's with n*M rows (fast.FastDecoder.decode's block-state wiring, the
-// mix and message-gate kernels, cuBLASLt GEMMs over the dense rows (BF16, or FP8 rows dequantized per visit), the
-// grouped MoE GEMMs); the attention is the decode attention kernel over each sequence's slot
-// (attn::DecodeArgs::batch, M rows causal), the short convolutions continue each slot's conv state. Then the head
-// over every row and one token per row (kernels::batch::sample).
+// mix and message-gate kernels, GEMMs over the dense rows (BF16, or FP8 rows dequantized per visit; algorithms
+// measured in place, kernels::batch::TunedGemm), the grouped MoE GEMMs); the attention is the decode attention
+// kernel over each sequence's slot (attn::DecodeArgs::batch, M rows causal), the short convolutions continue each
+// slot's conv state. Then the head over every row and one token per row (kernels::batch::sample).
 //
 // With max_m > 1 a step of M > 1 rows also keeps what speculative decoding needs: the rows' DSpark taps
 // (taps()), and the conv inputs plus the conv rows the step overwrites, so that rollback() can keep only each
@@ -111,7 +111,7 @@ class BatchDecoder {
   int max_seqs_, max_m_;
   int last_n_ = 0, last_m_ = 0;  // the last step's shape (rollback)
   cudaStream_t stream_;
-  std::unique_ptr<kernels::prefill::Gemm> gemm_;
+  std::unique_ptr<kernels::batch::TunedGemm> gemm_;
   std::vector<DeviceBuffer> storage_;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
   DeviceBuffer attn_ws_;
@@ -128,7 +128,9 @@ class BatchDecoder {
   __nv_bfloat16 *proj16_, *attn_out_, *wo_out_;
   float* proj32_;
   __nv_bfloat16 *gin_, *g16_;
-  float *fpre_, *gpre_;
+  float* fg_;  // the gates' forget | gain products, fp32 [3, rows, 2H]
+  // per layer (loop layers): the gates' forget16 | gain16 rows, bf16 [G, 2H, GATE_RANK] (G = 3 qkv, 1 mlp)
+  std::array<const __nv_bfloat16*, LAYERS> fg_qkv_{}, fg_mlp_{};
   float *router_logits_, *wts_;
   int* idx_;
   int *counts_, *tiles_n_, *pair_token_, *pair_dst_;

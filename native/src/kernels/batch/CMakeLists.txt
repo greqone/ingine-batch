@@ -1,5 +1,7 @@
 add_library(ingine_kernels_batch STATIC
   batch.cu
+  dense.cpp
+  dense.cu
   draft_attention.cu
   draft_markov.cu
   draft_rows.cu
