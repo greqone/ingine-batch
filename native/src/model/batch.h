@@ -58,10 +58,11 @@ void reset_slot(BatchState& st, int s, cudaStream_t stream);
 // kernel over each sequence's slot (attn::DecodeArgs::batch, M rows causal), the short convolutions continue each
 // slot's conv state. Then the head over every row and one token per row (kernels::batch::sample).
 //
-// With max_m > 1 a step of M > 1 rows also keeps what speculative decoding needs: the rows' DSpark taps
-// (taps()), and the conv inputs plus the conv rows the step overwrites, so that rollback() can keep only each
-// sequence's accepted rows (engine._rollback). The caches need no rollback: a slot's rings never wrap, and the
-// rows written past a sequence's accepted length are never read before they are written again.
+// With max_m > 1 a step with more than one row for some sequence also keeps what speculative decoding needs: the
+// rows' DSpark taps (taps()) and the conv inputs; its convolutions leave the slots' conv states as they were, and
+// accept() writes them once each sequence's kept rows are known (engine._rollback). The caches need no rollback: a
+// slot's rings never wrap, and the rows written past a sequence's accepted length are never read before they are
+// written again.
 class BatchDecoder {
  public:
   BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st, int max_seqs, cudaStream_t stream,
@@ -92,9 +93,10 @@ class BatchDecoder {
                                      const std::int64_t* pos, float temperature, std::uint64_t seed) {
     return step(n, 1, tokens, slots, pos, temperature, seed);
   }
-  // After a step: sequence b keeps its first commit[b] rows (1..m[b]; host array of the step's n): its slot's conv
-  // states become those after them. Stream-ordered.
-  void rollback(const std::int32_t* commit);
+  // After every step with more than one row for some sequence (a no-op otherwise): sequence b keeps its first
+  // kept[b] rows (1..m[b]; host array of the step's n), and its slot's conv states become those after them.
+  // Stream-ordered.
+  void accept(const std::int32_t* kept);
   // The last step's DSpark taps (max_m > 1, a step with more than one row for some sequence): device bf16 [rows, 4,
   // H] (model.TAP_VISITS partial blocks, then the final normed hidden), the Prefiller's layout.
   const __nv_bfloat16* taps() const { return taps_; }
@@ -136,7 +138,6 @@ class BatchDecoder {
   __nv_bfloat16 *xin_, *xm_, *xf_;
   float *mixf_, *msgs_, *mixm_;
   __nv_bfloat16 *proj16_, *attn_out_, *wo_out_;
-  float* proj32_;
   __nv_bfloat16 *gin_, *g16_;
   float* fg_;  // the gates' forget | gain products, fp32 [3, rows, 2H]
   // per layer (loop layers): the gates' forget16 | gain16 rows, bf16 [G, 2H, GATE_RANK] (G = 3 qkv, 1 mlp)
@@ -151,7 +152,6 @@ class BatchDecoder {
   // speculative verify (max_m > 1): taps, conv inputs per visit, conv rows the step overwrites, accepted rows
   __nv_bfloat16* taps_ = nullptr;
   __nv_bfloat16 *hist_k_ = nullptr, *hist_v_ = nullptr, *hist_attn_ = nullptr, *hist_mlp_ = nullptr;
-  float* conv_backup_ = nullptr;
   std::int32_t* commit_ = nullptr;
 };
 

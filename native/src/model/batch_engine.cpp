@@ -143,6 +143,7 @@ void BatchEngine::prefill_together(std::span<const Admission> requests, std::spa
         first[which[j]] = got[std::size_t(off_[std::size_t(i) + 1]) - 1];
     }
     keep_ = m_;
+    dec_->accept(keep_.data());  // every prompt row is kept
     if (drafter_) commit_kept(n);
   }
 }
@@ -164,8 +165,9 @@ void BatchEngine::commit_kept(int n) {
 }
 
 void BatchEngine::draft(int n) {
+  // spec drafts per sequence (columns past them hold stale values and are never read)
   const BatchDrafter::Drafts d =
-      drafter_->draft(n, slot_.data(), anchor_.data(), next_pos_.data(), 0.f, seed_of(++draws_));
+      drafter_->draft(n, slot_.data(), anchor_.data(), next_pos_.data(), 0.f, seed_of(++draws_), spec_);
   draft_host_.resize(std::size_t(n) * G), conf_host_.resize(std::size_t(n) * G);
   CUDA_CHECK(cudaMemcpyAsync(draft_host_.data(), d.tokens, draft_host_.size() * 4, cudaMemcpyDeviceToHost, stream_.s));
   CUDA_CHECK(cudaMemcpyAsync(conf_host_.data(), d.conf, conf_host_.size() * 4, cudaMemcpyDeviceToHost, stream_.s));
@@ -234,7 +236,7 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
     seqs[i].pos = next_pos_[i] = pos_[i] + a + 1;
   }
   spec_steps_ += std::uint64_t(n);
-  dec_->rollback(keep_.data());
+  dec_->accept(keep_.data());
   commit_kept(n);
   draft(n);
 }

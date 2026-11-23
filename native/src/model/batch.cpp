@@ -135,7 +135,7 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   hid_ = f32(N * H), part_ = f32(N * H), y_ = f32(N * H), y2_ = f32(N * H);
   xin_ = bf16(3 * N * H), xm_ = bf16(N * H), xf_ = bf16(N * H);
   mixf_ = f32(3 * N * H), msgs_ = f32(4 * N * H), mixm_ = f32(N * H);
-  proj16_ = bf16(N * PROJ_ROWS_FULL), proj32_ = f32(N * PROJ_ROWS_FULL);
+  proj16_ = bf16(N * PROJ_ROWS_FULL);
   attn_out_ = bf16(N * HEADS * HEAD_DIM), wo_out_ = bf16(N * H);
   gin_ = bf16(3 * N * 2 * H), g16_ = bf16(3 * N * GATE_RANK);
   fg_ = f32(3 * N * 2 * H);
@@ -151,7 +151,6 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
     taps_ = bf16(N * NUM_TAPS * H);
     hist_k_ = bf16(NUM_VISITS * N * KV_DIM), hist_v_ = bf16(NUM_VISITS * N * KV_DIM);
     hist_attn_ = bf16(NUM_VISITS * N * H), hist_mlp_ = bf16(NUM_VISITS * N * H);
-    conv_backup_ = f32(S * std::size_t(kb::conv_backup_floats()));
     commit_ = i32(S);
   }
   for (auto& b : storage_) b.fill(0);
@@ -205,14 +204,14 @@ kb::ConvStates BatchDecoder::conv_states() const {
           st_.conv_kv_stride(),                   st_.conv_h_stride()};
 }
 
-void BatchDecoder::rollback(const std::int32_t* commit) {
-  if (!last_verify_) return;  // every sequence had one row: nothing to undo
+void BatchDecoder::accept(const std::int32_t* kept) {
+  if (!last_verify_) return;  // every sequence had one row: its states advanced in the step
   for (int b = 0; b < last_n_; ++b)
-    if (commit[b] < 1 || commit[b] > last_m_[std::size_t(b)])
-      throw std::invalid_argument("BatchDecoder::rollback: commit outside 1..m");
-  CUDA_CHECK(cudaMemcpyAsync(commit_, commit, std::size_t(last_n_) * 4, cudaMemcpyHostToDevice, stream_));
-  kb::conv_rollback(conv_states(), last_n_, slots_, conv_backup_, {hist_k_, hist_v_, hist_attn_, hist_mlp_},
-                    rows_host_[std::size_t(last_n_)], rows_, commit_, stream_);
+    if (kept[b] < 1 || kept[b] > last_m_[std::size_t(b)])
+      throw std::invalid_argument("BatchDecoder::accept: kept rows outside 1..m");
+  CUDA_CHECK(cudaMemcpyAsync(commit_, kept, std::size_t(last_n_) * 4, cudaMemcpyHostToDevice, stream_));
+  kb::conv_commit(conv_states(), last_n_, slots_, {hist_k_, hist_v_, hist_attn_, hist_mlp_},
+                  rows_host_[std::size_t(last_n_)], rows_, commit_, stream_);
 }
 
 std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, const std::int32_t* tokens,
@@ -250,7 +249,6 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
               temperature[b]);
   CUDA_CHECK(cudaMemcpyAsync(temps_, temps_host_.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
   last_n_ = n, last_verify_ = verify;
-  if (verify) kb::conv_save(conv_states(), n, slots_, conv_backup_, s);
 
   auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
                  const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
@@ -362,14 +360,14 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
                    rows, H, s, {2, std::int64_t(slab), std::int64_t(rows) * H, rows});
       }
     }
-    kb::widen(proj16_, R, T, R, proj32_, R, s);
-    if (verify)  // the k/v conv inputs (engine._rollback's history)
+    if (verify)  // the k/v conv inputs (the states are written after acceptance)
       kb::keep_kv(proj16_, R, T, SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], hist_k_ + std::size_t(v) * T * KV_DIM,
                   hist_v_ + std::size_t(v) * T * KV_DIM, s);
 
     // ---- attention: every sequence over its own slot
     attn::DecodeArgs a;
-    a.proj = proj32_;
+    a.proj16 = proj16_;
+    a.conv_write = !verify;
     a.M = M;
     a.q_scale = f32p(layer.q_scale);
     a.r_scale = f32p(layer.r_scale);
@@ -416,7 +414,9 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
     __nv_bfloat16* const wo_dst = verify ? hist_attn_ + std::size_t(v) * slab : wo_out_;
     gemm_->run(attn_out_, HEADS * HEAD_DIM, bf16_rows(layer.wo), HEADS * HEAD_DIM, wo_dst, H, false, T, H,
                HEADS * HEAD_DIM, s);
-    kb::conv(wo_dst, H, n, rows_, H, f32p(layer.attn_conv), s0.conv_attn_at(v), st_.conv_h_stride(), slots_, y_, s);
+    kb::conv(wo_dst, H, n, rows_, H, f32p(layer.attn_conv), s0.conv_attn_at(v), st_.conv_h_stride(), slots_, !verify,
+             y_,
+             s);
 
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
     std::vector<const float*> mlp_blocks = blocks;
@@ -444,7 +444,9 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
     kb::moe_down(me, act_, T, work, down_, s);
     __nv_bfloat16* const moe_dst = verify ? hist_mlp_ + std::size_t(v) * slab : moe_sum_;
     pk::moe_combine(down_, wts_, T, moe_dst, s);
-    kb::conv(moe_dst, H, n, rows_, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, y2_, s);
+    kb::conv(moe_dst, H, n, rows_, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, !verify,
+             y2_,
+             s);
     prev_v = v;
   }
 

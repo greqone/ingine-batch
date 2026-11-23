@@ -14,7 +14,7 @@ __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__floa
 // one thread per (channel, sequence); the sequence's rows in order, as prefill::static_conv + conv_state_update
 __global__ void conv_kernel(const std::uint16_t* __restrict__ x, int ld, const std::int32_t* __restrict__ rows, int C,
                             const float* __restrict__ w, float* __restrict__ state, long long slot_stride,
-                            const std::int32_t* __restrict__ slots, float* __restrict__ out) {
+                            const std::int32_t* __restrict__ slots, int write_state, float* __restrict__ out) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int b = blockIdx.y;
   if (c >= C) return;
@@ -32,16 +32,7 @@ __global__ void conv_kernel(const std::uint16_t* __restrict__ x, int ld, const s
     out[r * C + c] = __fmul_rn(__fadd_rn(acc, e3), inv);
     e0 = e1, e1 = e2, e2 = e3;
   }
-  st[c] = e0, st[C + c] = e1, st[2 * C + c] = e2;
-}
-
-__global__ void widen_kernel(const std::uint16_t* __restrict__ src, int ld_src, int rows, int cols, float* __restrict__ dst,
-                             int ld_dst) {
-  const std::size_t n = std::size_t(rows) * cols;
-  for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x) {
-    const std::size_t r = i / cols, c = i % cols;
-    dst[r * ld_dst + c] = bf2f(src[r * ld_src + c]);
-  }
+  if (write_state) st[c] = e0, st[C + c] = e1, st[2 * C + c] = e2;
 }
 
 __device__ __forceinline__ std::uint64_t mix64(std::uint64_t z) {
@@ -124,12 +115,6 @@ __device__ __forceinline__ ConvVec conv_vec(int q, int R) {
   return a;
 }
 constexpr int conv_vecs(int R) { return VISITS * R * (2 * KV4 + 2 * H4); }
-// the backup's float4 index of (kind, visit, saved row 0..1 = state row 1..2, column)
-__device__ __forceinline__ int backup_vec(int kind, int v, int row, int c4) {
-  const int kv = VISITS * 2 * KV4, h = VISITS * 2 * H4;
-  const int base = kind == 0 ? 0 : kind == 1 ? kv : kind == 2 ? 2 * kv : 2 * kv + h;
-  return base + (v * 2 + row) * (kind < 2 ? KV4 : H4) + c4;
-}
 __device__ __forceinline__ float* state_of(const ConvStates& st, int kind, long long slot) {
   return kind == 0 ? st.k + slot * st.kv_stride
        : kind == 1 ? st.v + slot * st.kv_stride
@@ -137,33 +122,29 @@ __device__ __forceinline__ float* state_of(const ConvStates& st, int kind, long 
                    : st.mlp + slot * st.h_stride;
 }
 
-__global__ void conv_save_kernel(ConvStates st, const std::int32_t* __restrict__ slots, float4* __restrict__ backup) {
+// one thread per (sequence, conv, visit, 4 columns): reads the three old rows, then writes the new ones
+__global__ void conv_commit_kernel(ConvStates st, const std::int32_t* __restrict__ slots, ConvHistory hist, int T,
+                                   const std::int32_t* __restrict__ rows, const std::int32_t* __restrict__ commit) {
   const int b = blockIdx.y, q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= conv_vecs(2)) return;
-  const ConvVec a = conv_vec(q, 2);
-  const float* s = state_of(st, a.kind, slots[b]) + (std::size_t(a.v) * 3 + 1 + a.row) * (4 * a.C4) + 4 * a.c4;
-  backup[std::size_t(b) * conv_vecs(2) + q] = *reinterpret_cast<const float4*>(s);
-}
-
-__global__ void conv_rollback_kernel(ConvStates st, const std::int32_t* __restrict__ slots,
-                                     const float4* __restrict__ backup, ConvHistory hist, int T,
-                                     const std::int32_t* __restrict__ rows, const std::int32_t* __restrict__ commit) {
-  const int b = blockIdx.y, q = blockIdx.x * blockDim.x + threadIdx.x;
-  const int c = commit[b], r0 = rows[b];
-  if (c >= rows[b + 1] - r0 || q >= conv_vecs(3)) return;
-  const ConvVec a = conv_vec(q, 3);
-  const int src = c + a.row, C = 4 * a.C4;  // row src of [rows 0..2 before the step, the sequence's inputs]
-  float4 x;
-  if (src < 3) {
-    x = backup[std::size_t(b) * conv_vecs(2) + backup_vec(a.kind, a.v, src - 1, a.c4)];
-  } else {
-    const __nv_bfloat16* h = a.kind == 0 ? hist.k : a.kind == 1 ? hist.v : a.kind == 2 ? hist.attn : hist.mlp;
-    const uint2 u = *reinterpret_cast<const uint2*>(h + (std::size_t(a.v) * T + std::size_t(r0) + src - 3) * C +
-                                                    4 * a.c4);
-    x = make_float4(bf2f(std::uint16_t(u.x)), bf2f(std::uint16_t(u.x >> 16)), bf2f(std::uint16_t(u.y)),
-                    bf2f(std::uint16_t(u.y >> 16)));
+  if (q >= conv_vecs(1)) return;
+  const ConvVec a = conv_vec(q, 1);
+  const int c = commit[b], r0 = rows[b], C = 4 * a.C4;
+  float* const s = state_of(st, a.kind, slots[b]) + std::size_t(a.v) * 3 * C + 4 * a.c4;
+  const __nv_bfloat16* h = a.kind == 0 ? hist.k : a.kind == 1 ? hist.v : a.kind == 2 ? hist.attn : hist.mlp;
+  float4 old[3], row[3];
+  for (int j = 0; j < 3; ++j) old[j] = *reinterpret_cast<const float4*>(s + j * C);
+  for (int j = 0; j < 3; ++j) {  // row c + j of [old rows 0..2, the sequence's inputs]
+    const int src = c + j;
+    if (src < 3) {
+      row[j] = old[src];
+    } else {
+      const uint2 u =
+          *reinterpret_cast<const uint2*>(h + (std::size_t(a.v) * T + std::size_t(r0) + src - 3) * C + 4 * a.c4);
+      row[j] = make_float4(bf2f(std::uint16_t(u.x)), bf2f(std::uint16_t(u.x >> 16)), bf2f(std::uint16_t(u.y)),
+                           bf2f(std::uint16_t(u.y >> 16)));
+    }
   }
-  *reinterpret_cast<float4*>(state_of(st, a.kind, slots[b]) + (std::size_t(a.v) * 3 + a.row) * C + 4 * a.c4) = x;
+  for (int j = 0; j < 3; ++j) *reinterpret_cast<float4*>(s + j * C) = row[j];
 }
 
 __global__ void gather_rows_kernel(const uint4* __restrict__ src, int row8, const std::int32_t* __restrict__ rows,
@@ -176,19 +157,19 @@ __global__ void gather_rows_kernel(const uint4* __restrict__ src, int row8, cons
 }  // namespace
 
 void conv(const __nv_bfloat16* x, int ld, int n, const std::int32_t* rows, int C, const float* w, float* state,
-          std::int64_t slot_stride, const std::int32_t* slots, float* out, cudaStream_t stream) {
+          std::int64_t slot_stride, const std::int32_t* slots, bool write_state, float* out, cudaStream_t stream) {
   if (n <= 0) return;
   const dim3 grid((C + 127) / 128, n);
   conv_kernel<<<grid, 128, 0, stream>>>(reinterpret_cast<const std::uint16_t*>(x), ld, rows, C, w, state, slot_stride,
-                                        slots, out);
+                                        slots, write_state ? 1 : 0, out);
   CUDA_CHECK(cudaGetLastError());
 }
 
-void widen(const __nv_bfloat16* src, int ld_src, int rows, int cols, float* dst, int ld_dst, cudaStream_t stream) {
-  if (rows <= 0 || cols <= 0) return;
-  const std::size_t n = std::size_t(rows) * cols;
-  const int blocks = int(std::min<std::size_t>((n + 255) / 256, 4096));
-  widen_kernel<<<blocks, 256, 0, stream>>>(reinterpret_cast<const std::uint16_t*>(src), ld_src, rows, cols, dst, ld_dst);
+void conv_commit(const ConvStates& st, int n, const std::int32_t* slots, const ConvHistory& hist, int T,
+                 const std::int32_t* rows, const std::int32_t* commit, cudaStream_t stream) {
+  if (n <= 0) return;
+  const dim3 grid((conv_vecs(1) + 255) / 256, n);
+  conv_commit_kernel<<<grid, 256, 0, stream>>>(st, slots, hist, T, rows, commit);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -214,24 +195,6 @@ void keep_kv(const __nv_bfloat16* proj, int ld, int rows, int k_off, int v_off, 
   if (ld % 8 || k_off % 8 || v_off % 8) throw std::invalid_argument("batch::keep_kv: unaligned columns");
   keep_kv_kernel<<<rows, 256, 0, stream>>>(reinterpret_cast<const uint4*>(proj), ld / 8, k_off / 8, v_off / 8,
                                            reinterpret_cast<uint4*>(hist_k), reinterpret_cast<uint4*>(hist_v));
-  CUDA_CHECK(cudaGetLastError());
-}
-
-void conv_save(const ConvStates& st, int n, const std::int32_t* slots, float* backup, cudaStream_t stream) {
-  if (n <= 0) return;
-  static_assert(conv_backup_floats() == 4LL * conv_vecs(2));
-  const dim3 grid((conv_vecs(2) + 255) / 256, n);
-  conv_save_kernel<<<grid, 256, 0, stream>>>(st, slots, reinterpret_cast<float4*>(backup));
-  CUDA_CHECK(cudaGetLastError());
-}
-
-void conv_rollback(const ConvStates& st, int n, const std::int32_t* slots, const float* backup,
-                   const ConvHistory& hist, int T, const std::int32_t* rows, const std::int32_t* commit,
-                   cudaStream_t stream) {
-  if (n <= 0) return;
-  const dim3 grid((conv_vecs(3) + 255) / 256, n);
-  conv_rollback_kernel<<<grid, 256, 0, stream>>>(st, slots, reinterpret_cast<const float4*>(backup), hist, T, rows,
-                                                 commit);
   CUDA_CHECK(cudaGetLastError());
 }
 

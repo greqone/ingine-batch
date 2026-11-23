@@ -394,7 +394,7 @@ int main(int argc, char** argv) {
           }
           if (!finished) still.push_back(b);
         }
-        if (M > 1) dec.rollback(keep.data());
+        if (M > 1) dec.accept(keep.data());
         step_s.push_back(since(ts));
         step_n.push_back(int(active.size()));
         active.swap(still);

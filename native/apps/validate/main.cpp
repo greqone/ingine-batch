@@ -269,7 +269,7 @@ void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cas
           agree[b] += s.top1;
         }
       }
-      dec.rollback(keep.data());
+      dec.accept(keep.data());
       for (int i = 0; i < na; ++i) done[in_slot[i]] += keep[i];
     }
     for (int b = 0; b < n; ++b)
