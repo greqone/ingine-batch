@@ -1,15 +1,19 @@
-// ingine-batch-bench: many requests at once on one GPU (model/batch.h). Each prompt is prefilled into its own slot,
-// then all sequences decode together, one token each per step, until each reaches the end of its turn or --tokens.
+// ingine-batch-bench: many requests at once on one GPU. By default the round runs through model::BatchEngine (what
+// `ingine-serve --batch` serves): every prompt is admitted into its own slot, then all sequences decode together
+// until each reaches the end of its turn or --tokens; --spec K verifies K DSpark drafts per sequence and step.
 // Reports the round's aggregate rate (every output token / wall time from the first prefill to the last token: the
 // "concurrent aggregate" of Strata's benchmark protocol), the decode-only rate and the step time.
 //
-//     ingine-batch-bench --seqs 64 --tokens 512
+//     ingine-batch-bench --seqs 64 --tokens 512 [--spec 3]
 //     ingine-batch-bench --seqs 8 --tokens 128 --reference --out ref.json   (the same prompts one at a time through
 //         the single-request Generator: compare its greedy outputs with a batch run's --out)
+// Test modes run their own loop over the BatchDecoder: --forced FILE (teacher-forced agreement), --spec K with
+// --oracle FILE (another run's tokens as drafts) or --accept-all (timing of K + 1 rows per sequence).
 #include "core/device.h"
 #include "ingine/generator.h"
 #include "kernels/batch/batch.h"
 #include "model/batch.h"
+#include "model/batch_engine.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "serve/cli.h"
@@ -70,15 +74,15 @@ int main(int argc, char** argv) {
   ap.option("--forced", "",
             "feed the output tokens of FILE (another run's --out) and report where this run's argmax differs from them",
             &forced_file);
-  ap.option("--spec", "", "speculative decoding: verify K drafts per sequence and step (greedy; 0 = off)", &spec);
+  ap.option("--spec", "", "speculative decoding: verify K DSpark drafts per sequence and step (0 = off)", &spec);
   ap.option("--oracle", "", "with --spec: the drafts are the output tokens of FILE (another run's --out)", &oracle_file);
   ap.flag("--accept-all", "with --spec, timing only: keep every verified row (the drafts are copies of the anchor)",
           &accept_all);
   ap.parse(argc, argv);
   if (slots == 0) slots = seqs;
-  if (spec < 0 || spec > 7 || (spec > 0 && (!forced_file.empty() || reference || temperature > 0)) ||
+  if (spec < 0 || spec > 7 || (spec > 0 && (!forced_file.empty() || reference)) ||
       (!oracle_file.empty() && accept_all) || ((accept_all || !oracle_file.empty()) && spec == 0)) {
-    std::fprintf(stderr, "--spec K: K in 0..7, greedy, not with --forced or --reference; --oracle or --accept-all need it\n");
+    std::fprintf(stderr, "--spec K: K in 0..7, not with --forced or --reference; --oracle or --accept-all need it\n");
     return 2;
   }
 
@@ -189,6 +193,81 @@ int main(int argc, char** argv) {
       report["mode"] = "reference";
       report["output_tokens"] = total_out;
       report["wall_s"] = wall;
+    } else if (forced.empty() && oracle.empty() && !accept_all) {
+      m::BatchEngineOptions options;
+      options.model_dir = model_dir;
+      options.ablation = ablation;
+      options.slots = slots;
+      options.ctx = ctx;
+      options.prefill_chunk = prefill_chunk;
+      options.spec = spec;
+      options.kv_fp8 = kv_fp8;
+      m::BatchEngine engine(options);
+      std::size_t free1 = 0;
+      cudaMemGetInfo(&free1, &total);
+      std::printf("engine: load %.1fs, GPU %.2f GB (slots %d x %d tokens, spec %d: %.2f GB besides the weights), "
+                  "%.2f GB free\n", since(t_load), double(free0 - free1) / 1e9, slots, ctx, spec,
+                  double(engine.device_bytes()) / 1e9, double(free1) / 1e9);
+      std::fflush(stdout);
+
+      const auto t0 = Clock::now();
+      std::vector<m::BatchBackend::Admission> admissions;
+      for (int b = 0; b < seqs; ++b) admissions.push_back({b, ids[b], float(temperature)});
+      const std::vector<std::int32_t> first = engine.admit(admissions);
+      const double prefill_s = since(t0);
+      std::vector<m::BatchBackend::Seq> running;
+      for (int b = 0; b < seqs; ++b) {
+        out[b].push_back(first[b]);
+        if (tokens > 1 && (ignore_eos || first[b] != end_id))
+          running.push_back({b, first[b], std::int64_t(ids[b].size()), float(temperature)});
+      }
+      std::vector<std::vector<std::int32_t>> emitted;
+      std::vector<double> step_s;
+      std::vector<int> step_n;
+      const auto t_dec = Clock::now();
+      while (!running.empty()) {
+        const auto ts = Clock::now();
+        engine.step(running, emitted);
+        step_s.push_back(since(ts));
+        step_n.push_back(int(running.size()));
+        std::vector<m::BatchBackend::Seq> still;
+        for (std::size_t i = 0; i < running.size(); ++i) {
+          const int b = running[i].slot;
+          bool finished = false;
+          for (std::int32_t t : emitted[i]) {
+            out[b].push_back(t);
+            finished = int(out[b].size()) >= tokens || (!ignore_eos && t == end_id);
+            if (finished) break;
+          }
+          if (!finished) still.push_back(running[i]);
+        }
+        running.swap(still);
+      }
+      const double decode_s = since(t_dec), wall = since(t0);
+      std::size_t total_out = 0, seq_steps = 0;
+      for (int b = 0; b < seqs; ++b) total_out += out[b].size();
+      for (int n : step_n) seq_steps += std::size_t(n);
+      double full_ms = 0;
+      int full = 0;
+      for (std::size_t i = 0; i < step_s.size(); ++i)
+        if (step_n[i] == seqs) full_ms += 1e3 * step_s[i], ++full;
+      std::printf("engine: %d requests, %zu output tokens; admission %.2fs, decode %.2fs in %zu steps (%.1f ms per step "
+                  "with all %d)\n", seqs, total_out, prefill_s, decode_s, step_s.size(), full ? full_ms / full : 0.0,
+                  seqs);
+      if (spec > 0)
+        std::printf("spec: %d drafts per step, %.3f tokens per sequence and step (%.3f drafts accepted)\n", spec,
+                    double(total_out - std::size_t(seqs)) / double(seq_steps),
+                    double(engine.spec_accepted()) / double(engine.spec_steps()));
+      std::printf("AGGREGATE %.1f tok/s (%zu output tokens / %.2fs from the first prefill to the last token)\n",
+                  double(total_out) / wall, total_out, wall);
+      report["mode"] = "engine";
+      report["spec"] = spec;
+      report["output_tokens"] = total_out;
+      report["wall_s"] = wall;
+      report["prefill_s"] = prefill_s;
+      report["decode_s"] = decode_s;
+      report["aggregate_tps"] = double(total_out) / wall;
+      report["full_step_ms"] = full ? full_ms / full : 0.0;
     } else {
       cudaStream_t stream;
       CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));

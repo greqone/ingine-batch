@@ -166,6 +166,13 @@ __global__ void conv_rollback_kernel(ConvStates st, const std::int32_t* __restri
   *reinterpret_cast<float4*>(state_of(st, a.kind, slots[b]) + (std::size_t(a.v) * 3 + a.row) * C + 4 * a.c4) = x;
 }
 
+__global__ void gather_rows_kernel(const uint4* __restrict__ src, int row8, const std::int32_t* __restrict__ rows,
+                                   uint4* __restrict__ dst) {
+  const uint4* s = src + std::size_t(rows[blockIdx.x]) * row8;
+  uint4* d = dst + std::size_t(blockIdx.x) * row8;
+  for (int i = threadIdx.x; i < row8; i += blockDim.x) d[i] = s[i];
+}
+
 }  // namespace
 
 void conv(const __nv_bfloat16* x, int ld, int n, int M, int C, const float* w, float* state, std::int64_t slot_stride,
@@ -224,6 +231,15 @@ void conv_rollback(const ConvStates& st, int n, const std::int32_t* slots, const
   const dim3 grid((conv_vecs(3) + 255) / 256, n);
   conv_rollback_kernel<<<grid, 256, 0, stream>>>(st, slots, reinterpret_cast<const float4*>(backup), hist, M, n * M,
                                                  commit);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void gather_rows(const __nv_bfloat16* src, int row_elems, const std::int32_t* rows, int count, __nv_bfloat16* dst,
+                 cudaStream_t stream) {
+  if (count <= 0) return;
+  if (row_elems % 8) throw std::invalid_argument("batch::gather_rows: rows of a multiple of 8 elements");
+  gather_rows_kernel<<<count, 256, 0, stream>>>(reinterpret_cast<const uint4*>(src), row_elems / 8, rows,
+                                                reinterpret_cast<uint4*>(dst));
   CUDA_CHECK(cudaGetLastError());
 }
 

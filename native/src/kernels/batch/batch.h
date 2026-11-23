@@ -52,5 +52,8 @@ void conv_save(const ConvStates& st, int n, const std::int32_t* slots, float* ba
 // backup, the inputs from hist rows b * M ..); nothing where commit[b] == M. commit: device int32 [n].
 void conv_rollback(const ConvStates& st, int n, const std::int32_t* slots, const float* backup,
                    const ConvHistory& hist, int M, const std::int32_t* commit, cudaStream_t stream);
+// dst row i = src row rows[i], rows of row_elems bf16 (a multiple of 8); rows: device int32 [count].
+void gather_rows(const __nv_bfloat16* src, int row_elems, const std::int32_t* rows, int count, __nv_bfloat16* dst,
+                 cudaStream_t stream);
 
 }  // namespace ingine::kernels::batch
