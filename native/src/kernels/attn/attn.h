@@ -42,7 +42,9 @@ struct DecodeArgs {
   const std::int32_t* slots = nullptr;
   std::int64_t cache_stride = 0, kpos_stride = 0, conv_stride = 0;
   // ragged rows: device int32 [batch + 1]; sequence b's rows are [rows[b], rows[b+1]) of proj and out (m_b =
-  // rows[b+1] - rows[b], 1..M), at positions pos[b] ..; null: b*M .. b*M+M-1 (every sequence M rows)
+  // rows[b+1] - rows[b], 1..M), at positions pos[b] ..; null: b*M .. b*M+M-1 (every sequence M rows).
+  // Written before the call (read after griddepcontrol.wait). Batched kernel only (attn_decode takes it at any
+  // batch).
   const std::int32_t* rows = nullptr;
 };
 
@@ -54,7 +56,7 @@ std::size_t workspace_bytes(int max_m, int max_batch = 1);
 // How many of the kernel's 16-block clusters (one per KV head, 8 per call) fit on the GPU at once.
 int max_active_clusters(int M, int window);
 
-// batch == 1: the cluster kernel below; batch > 1: the batched kernel (attn_batch.h).
+// batch == 1 without ragged rows: the cluster kernel below; otherwise the batched kernel (attn_batch.h).
 void attn_decode(const DecodeArgs& a, cudaStream_t stream);
 
 // The 16-block-cluster kernel (one sequence at long context: all 16 x 8 blocks per sequence) at any batch; its
