@@ -41,7 +41,10 @@ class BatchEngine final : public BatchBackend {
   int slots() const override { return st_.slots; }
   int ctx() const override { return st_.ctx; }
   int lookahead() const override { return 0; }
-  // Admissions one after the other through the Prefiller, then the first tokens.
+  // Prompts of up to kStepPrefill tokens: together, in decode steps of up to 8 rows per prompt (a prompt's last
+  // block padded, the padding rolled back); longer ones one after the other through the Prefiller. Then the first
+  // tokens.
+  static constexpr int kStepPrefill = 256;
   std::vector<std::int32_t> admit(std::span<const Admission> requests) override;
   void step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t>>& emitted) override;
 
@@ -59,12 +62,16 @@ class BatchEngine final : public BatchBackend {
   Ablation abl_;
   BatchState st_;
   std::unique_ptr<Prefiller> pf_;
-  std::unique_ptr<BatchDecoder> dec_;
+  std::unique_ptr<BatchDecoder> dec_;  // 8 rows per sequence at most (admissions)
   DeviceBuffer chunk_, logits_, first_;
   std::uint64_t draws_ = 0;  // seeds the noise of sampled tokens: one per sampling call
   std::vector<std::int32_t> tok_, slot_;
   std::vector<std::int64_t> pos_;
   std::vector<float> temp_;
+
+  void prefill_one(const Admission& a, std::int32_t& first);
+  void prefill_together(std::span<const Admission> requests, std::span<const std::size_t> which,
+                        std::vector<std::int32_t>& first);
 };
 
 }  // namespace ingine::model
