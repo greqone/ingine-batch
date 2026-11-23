@@ -119,7 +119,7 @@ void Scheduler::withdraw(const std::shared_ptr<Job>& job) {
 
 SchedulerStats Scheduler::stats() const {
   std::lock_guard lock(mutex_);
-  return {int(waiting_.size()), active_ != nullptr, max_queue_};
+  return {int(waiting_.size()), active_ != nullptr, max_queue_, active_ != nullptr ? 1 : 0};
 }
 
 void Scheduler::close() {

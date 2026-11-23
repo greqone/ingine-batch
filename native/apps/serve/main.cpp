@@ -1,4 +1,5 @@
-// ingine-serve: the OpenAI-compatible chat completions server (flags and defaults of `python -m ingine.server`).
+// ingine-serve: the OpenAI-compatible chat completions server (flags and defaults of `python -m ingine.server`;
+// --batch: many requests decoded together, model/batch_engine.h).
 #include "engine/fake_generator.h"
 #include "engine/log.h"
 #include "image/image.h"
@@ -6,6 +7,11 @@
 #include "serve/chat_server.h"
 #include "serve/cli.h"
 #include "text/chat.h"
+
+#ifdef INGINE_WITH_MODEL
+#include "engine/batch_scheduler.h"
+#include "model/batch_engine.h"
+#endif
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -66,7 +72,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
+  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, batch = 0, batch_ctx = 4096;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -112,7 +118,16 @@ int main(int argc, char** argv) {
   ap.option("--top-p", "", "top_p of requests that omit it (default: generation_config.json, else 1)", &top_p);
   ap.option("--top-k", "", "top_k of requests that omit it, 0 = off (default: generation_config.json, else 0)",
             &top_k);
+  ap.option("--batch", "",
+            "batched serving: up to N requests decode together, each in a slot of --batch-ctx positions (with "
+            "--engine; BF16 dense weights, text only, temperature sampling)",
+            &batch);
+  ap.option("--batch-ctx", "", "positions of a request slot with --batch (prompt and output)", &batch_ctx);
   ap.parse(argc, argv);
+  if (batch < 0 || (batch > 0 && (!engine || dense_fp8 || spec))) {
+    std::cerr << "ingine-serve: error: --batch N needs --engine, without --dense-fp8 and --spec\n";
+    return 2;
+  }
   if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
     std::cerr << "ingine-serve: error: --image-max-tokens must be in [1, " << ingine::image::MAX_TOKENS
               << "] and --max-images, --max-image-tokens at least 0\n";
@@ -132,30 +147,6 @@ int main(int argc, char** argv) {
 
   try {
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
-    std::unique_ptr<ingine::model::Generator> generator;
-    if (fake) {
-      generator = std::make_unique<ingine::engine::FakeGenerator>(
-          fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir), ingine::engine::FakeGenerator::Responder{},
-          fake_delay);
-    } else {
-#ifdef INGINE_WITH_MODEL
-      ingine::model::RuntimeOptions options;
-      options.model_dir = model_dir;
-      options.ablation = ablation;
-      options.max_ctx = max_ctx;
-      options.dense_fp8 = dense_fp8;
-      options.kv_fp8 = kv_fp8;
-      options.spec = spec;
-      options.spec_threshold = float(spec_threshold);
-      options.park_mb = park_mb;
-      options.vision = !no_vision;
-      generator = ingine::model::make_generator(options);
-#else
-      log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
-      return 1;
-#endif
-    }
-
     ingine::serve::ServerOptions server_options;
     server_options.max_queue = max_queue;
     server_options.max_model_len = max_model_len;
@@ -164,14 +155,62 @@ int main(int argc, char** argv) {
     if (temperature >= 0) server_options.sampling.temperature = float(temperature);
     if (top_p >= 0) server_options.sampling.top_p = float(top_p);
     if (top_k >= 0) server_options.sampling.top_k = top_k;
-    server_options.images.enabled = !no_vision;
+    server_options.images.enabled = !no_vision && batch == 0;
     server_options.images.limits.max_tokens = image_max_tokens;
     server_options.images.max_images = max_images;
     server_options.images.max_total_tokens = max_image_tokens;
+
+    std::unique_ptr<ingine::model::Generator> generator;
+#ifdef INGINE_WITH_MODEL
+    std::unique_ptr<ingine::model::BatchEngine> batch_engine;
+#endif
+    std::unique_ptr<ingine::serve::ChatServer> server;  // after the model it serves: destroyed first
+    if (fake) {
+      generator = std::make_unique<ingine::engine::FakeGenerator>(
+          fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir), ingine::engine::FakeGenerator::Responder{},
+          fake_delay);
+    } else {
+#ifdef INGINE_WITH_MODEL
+      if (batch > 0) {
+        ingine::model::BatchEngineOptions options;
+        options.model_dir = model_dir;
+        options.ablation = ablation;
+        options.slots = batch;
+        options.ctx = batch_ctx;
+        options.kv_fp8 = kv_fp8;
+        batch_engine = std::make_unique<ingine::model::BatchEngine>(options);
+        log.info("batched serving: {} slots of {} positions ({:.2f} GB of caches and scratch)", batch, batch_ctx,
+                 double(batch_engine->device_bytes()) / 1e9);
+      } else {
+        ingine::model::RuntimeOptions options;
+        options.model_dir = model_dir;
+        options.ablation = ablation;
+        options.max_ctx = max_ctx;
+        options.dense_fp8 = dense_fp8;
+        options.kv_fp8 = kv_fp8;
+        options.spec = spec;
+        options.spec_threshold = float(spec_threshold);
+        options.park_mb = park_mb;
+        options.vision = !no_vision;
+        generator = ingine::model::make_generator(options);
+      }
+#else
+      log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
+      return 1;
+#endif
+    }
     log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
              server_options.sampling.top_p, server_options.sampling.top_k);
-    ingine::serve::ChatServer server(*generator, fmt, server_options);
-    if (!server.bind(host, port)) {
+#ifdef INGINE_WITH_MODEL
+    if (batch_engine) {
+      server_options.http_threads = batch + 8;
+      server = std::make_unique<ingine::serve::ChatServer>(
+          std::make_unique<ingine::engine::BatchScheduler>(*batch_engine, fmt.stop_ids(), max_queue),
+          batch_engine->model_id(), batch_engine->ctx() - batch_engine->lookahead(), fmt, server_options);
+    }
+#endif
+    if (!server) server = std::make_unique<ingine::serve::ChatServer>(*generator, fmt, server_options);
+    if (!server->bind(host, port)) {
       log.critical("cannot bind {}:{}", host, port);
       return 1;
     }
@@ -179,23 +218,23 @@ int main(int argc, char** argv) {
     if (::pipe(g_stop_pipe) != 0) throw std::runtime_error("pipe() failed");
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    log.info("image input: {}", !no_vision && generator->supports_images()
+    log.info("image input: {}", generator && !no_vision && generator->supports_images()
                                     ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
                                                   image_max_tokens, max_images, max_image_tokens)
                                     : std::string("off"));
-    log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
+    log.info("serving {} on http://{}:{}/v1", server->model_id(), host, server->port());
     bool listened = true;
     std::thread listener([&] {
-      listened = server.listen();
+      listened = server->listen();
       handle_signal(0);  // the accept loop ended on its own: wake the main thread
     });
     char c;
     while (::read(g_stop_pipe[0], &c, 1) < 0 && errno == EINTR) {
     }
-    server.stop();
+    server->stop();
     listener.join();
     if (!listened) {
-      log.critical("listen failed on {}:{}", host, server.port());
+      log.critical("listen failed on {}:{}", host, server->port());
       return 1;
     }
     return 0;

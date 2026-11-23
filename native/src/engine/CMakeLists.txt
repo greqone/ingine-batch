@@ -1,6 +1,7 @@
-# ingine_engine: the request scheduler (one running job + bounded FIFO) over model::Generator, the canned-output
-# FakeGenerator and the server's logger. CUDA-free.
+# ingine_engine: the request schedulers (one running job + bounded FIFO over model::Generator; batched over
+# model::BatchBackend), the canned-output FakeGenerator and the server's logger. CUDA-free.
 add_library(ingine_engine STATIC
+  batch_scheduler.cpp
   fake_generator.cpp
   log.cpp
   scheduler.cpp

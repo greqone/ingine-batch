@@ -149,10 +149,30 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
         return images;
       }()),
       created_(std::time(nullptr)),
-      scheduler_(generator, fmt.stop_ids(), options.max_queue) {
-  // A pool thread per connection, as ThreadingHTTPServer: the running request, the waiting ones, the ones
+      queue_(std::make_unique<engine::Scheduler>(generator, fmt.stop_ids(), options.max_queue)) {
+  setup(options.http_threads);
+}
+
+ChatServer::ChatServer(std::unique_ptr<engine::JobQueue> queue, const std::string& model_id, int max_model_len,
+                       const text::ChatFormat& fmt, ServerOptions options)
+    : fmt_(fmt),
+      model_id_(options.model_id.empty() ? model_id : options.model_id),
+      max_model_len_(options.max_model_len ? options.max_model_len : max_model_len),
+      sampling_defaults_(options.sampling),
+      image_options_([&] {
+        ImageOptions images = options.images;
+        images.enabled = false;
+        return images;
+      }()),
+      created_(std::time(nullptr)),
+      queue_(std::move(queue)) {
+  setup(options.http_threads);
+}
+
+void ChatServer::setup(int http_threads) {
+  // A pool thread per connection, as ThreadingHTTPServer: the running requests, the waiting ones, the ones
   // rejected with 503 and /health probes must all be served concurrently.
-  server_.new_task_queue = [] { return new httplib::ThreadPool(8, 1024); };
+  server_.new_task_queue = [http_threads] { return new httplib::ThreadPool(std::size_t(http_threads), 1024); };
   server_.set_socket_options(configure_http_server_socket);
   register_routes();
 }
@@ -180,12 +200,13 @@ Json ChatServer::model_card() const {
 void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res) {
   const std::string path = route_path(req);
   if (path == "/health") {
-    const engine::SchedulerStats st = scheduler_.stats();
+    const engine::SchedulerStats st = queue_->stats();
     send_json(res, 200,
               Json{{"status", "ok"},
                    {"model", model_id_},
                    {"waiting", st.waiting},
                    {"running", st.running},
+                   {"active", st.active},
                    {"max_queue", st.max_queue}});
   } else if (path == "/v1/models") {
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});
@@ -231,7 +252,7 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
 void ChatServer::complete(const httplib::Request& req, httplib::Response& res, ChatRequest request) {
   auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling,
                                            std::move(request.images));
-  if (!scheduler_.submit(job)) {
+  if (!queue_->submit(job)) {
     res.set_header("Retry-After", "1");
     send_error(res, 503, "server busy: request queue is full");
     return;
@@ -243,7 +264,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
     try {
       pump(*x, [&req] { return req.is_connection_closed(); }, [](std::vector<text::Delta>&) {});
     } catch (const ClientDisconnected&) {
-      scheduler_.withdraw(x->job);
+      queue_->withdraw(x->job);
       log_disconnected(*x);
       res.set_header("Connection", "close");
       send_error(res, 500, "client disconnected");
@@ -303,7 +324,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
                  }
                });
         } catch (const ClientDisconnected&) {
-          scheduler_.withdraw(x.job);
+          queue_->withdraw(x.job);
           log_disconnected(x);
           return false;
         }
@@ -332,7 +353,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
       },
       [this, state](bool success) {
         // The client left before or while streaming: the job must not keep (or start) generating.
-        if (!success || !state->started.load(std::memory_order_acquire)) scheduler_.withdraw(state->x->job);
+        if (!success || !state->started.load(std::memory_order_acquire)) queue_->withdraw(state->x->job);
       });
 }
 
@@ -353,7 +374,7 @@ void ChatServer::start() {
 }
 
 void ChatServer::stop() {
-  scheduler_.close();
+  queue_->close();
   server_.stop();
   if (thread_.joinable()) thread_.join();
 }

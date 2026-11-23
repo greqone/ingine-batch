@@ -5,6 +5,7 @@ add_library(ingine_model STATIC
   runtime.cpp
   generator.cpp
   batch.cpp
+  batch_engine.cpp
   model_kernels.cu
 )
 # prefill (package Prefill) and the speculative loop (package Spec)

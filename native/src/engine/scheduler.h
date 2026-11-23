@@ -1,8 +1,9 @@
-// Request scheduler (mirror of engine/ingine/server.py Scheduler/Job): one worker thread runs jobs strictly one at
-// a time in FIFO order from a bounded waiting list. The worker only pulls token ids from Generator::generate and
-// pushes them to the job's output; detokenisation, parsing and HTTP writes happen on the request thread, so the
-// decode loop never waits on the client. Cancellation (client gone, stop string, shutdown) is checked between
-// the tokens the generator emits.
+// Request scheduling (mirror of engine/ingine/server.py Scheduler/Job). The HTTP server submits jobs to a
+// JobQueue: Scheduler runs them strictly one at a time in FIFO order from a bounded waiting list (one worker
+// thread); BatchScheduler (batch_scheduler.h) runs many at once. Workers only pull token ids from the model and
+// push them to the job's output; detokenisation, parsing and HTTP writes happen on the request thread, so the decode
+// loop never waits on the client. Cancellation (client gone, stop string, shutdown) is checked between the tokens
+// the model emits.
 #pragma once
 
 #include "ingine/generator.h"
@@ -53,6 +54,7 @@ class Job {
 
  private:
   friend class Scheduler;
+  friend class BatchScheduler;
   void started();
   void push(const std::vector<int32_t>& tokens);
   void fail(std::string message);
@@ -69,24 +71,35 @@ class Job {
 
 struct SchedulerStats {
   int waiting = 0;
-  bool running = false;
+  bool running = false;  // a job is generating
   int max_queue = 0;
+  int active = 0;        // jobs generating
 };
 
-class Scheduler {
+class JobQueue {
+ public:
+  virtual ~JobQueue() = default;
+  // False when closed or when the waiting list is full.
+  virtual bool submit(std::shared_ptr<Job> job) = 0;
+  // Cancels the job and drops it from the waiting list if it has not started.
+  virtual void withdraw(const std::shared_ptr<Job>& job) = 0;
+  virtual SchedulerStats stats() const = 0;
+  // Fails waiting jobs ("server shutting down"), cancels the running ones and joins the worker.
+  virtual void close() = 0;
+};
+
+class Scheduler final : public JobQueue {
  public:
   Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids, int max_queue);
-  ~Scheduler();
+  ~Scheduler() override;
   Scheduler(const Scheduler&) = delete;
   Scheduler& operator=(const Scheduler&) = delete;
 
   // False when closed or when max_queue jobs already wait (the running one counts as in server.py).
-  bool submit(std::shared_ptr<Job> job);
-  // Cancels the job and drops it from the waiting list if it has not started.
-  void withdraw(const std::shared_ptr<Job>& job);
-  SchedulerStats stats() const;
-  // Fails waiting jobs ("server shutting down"), cancels the running one and joins the worker.
-  void close();
+  bool submit(std::shared_ptr<Job> job) override;
+  void withdraw(const std::shared_ptr<Job>& job) override;
+  SchedulerStats stats() const override;
+  void close() override;
 
  private:
   void loop();
