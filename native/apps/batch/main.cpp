@@ -40,82 +40,16 @@ std::string default_model_dir() {
   return std::string(INGINE_REPO_DIR) + "/models/Inkling-2-Mini";
 }
 
-// short prompts of the kinds people send (code, explanations, writing, math); repeated when --seqs exceeds them
-const std::vector<std::string> kPrompts = {
-    "Write a Python function that checks whether a string is a palindrome, ignoring punctuation and case.",
-    "Explain how a hash map handles collisions, with a short Python example.",
-    "Write a Python module implementing an LRU cache with O(1) get/put, type hints and unit tests.",
-    "What is the difference between a process and a thread? Answer in a few paragraphs.",
-    "Write a SQL query that returns the top 5 customers by total order value, with their email addresses.",
-    "Explain the CAP theorem with a concrete example.",
-    "Write a bash script that finds the 10 largest files under a directory and prints their sizes.",
-    "Summarise the causes of the French Revolution.",
-    "Write a JavaScript debounce function and explain when to use it instead of throttle.",
-    "How does TCP congestion control work? Explain slow start and congestion avoidance.",
-    "Write a Rust function that parses a comma-separated list of integers and returns their sum, with error handling.",
-    "Explain gradient descent to a high-school student.",
-    "Write a Go HTTP server with one JSON endpoint that returns the current time.",
-    "What are the main differences between SQL and NoSQL databases?",
-    "Write a C function that reverses a singly linked list in place.",
-    "Explain what a closure is in JavaScript, with two examples.",
-    "Solve: a train travels 300 km at 75 km/h and returns at 100 km/h. What is its average speed for the trip?",
-    "Write a Python class for a bank account with deposit, withdraw and a transaction history.",
-    "Explain how public-key cryptography works, using RSA as the example.",
-    "Write a regular expression that validates an IPv4 address and explain each part.",
-    "Write a short story about a lighthouse keeper who finds a message in a bottle.",
-    "Explain the difference between `git merge` and `git rebase`, and when to use each.",
-    "Write a TypeScript interface for a blog post and a function that sorts posts by date.",
-    "What is the time complexity of quicksort, and why can it degrade to O(n^2)?",
-    "Write a Python script that reads a CSV file and prints the average of a numeric column.",
-    "Explain how vaccines train the immune system.",
-    "Write a binary search in Java and list its edge cases.",
-    "Describe the water cycle in detail.",
-    "Write a Dockerfile for a small Python Flask app and explain each line.",
-    "Explain the difference between supervised and unsupervised learning, with examples.",
-    "Write a function that merges two sorted arrays into one sorted array, in C++.",
-    "What causes the seasons on Earth?",
-    "Write a Python generator that yields the Fibonacci numbers and a test for it.",
-    "Explain how a CPU cache works and why cache misses are expensive.",
-    "Write an email to a landlord asking to fix a broken heater, polite but firm.",
-    "Prove that the square root of 2 is irrational.",
-    "Write a React component that shows a counter with increment and reset buttons.",
-    "Explain what Kubernetes does and the role of pods, services and deployments.",
-    "Write a Python function that flattens an arbitrarily nested list.",
-    "Explain the difference between latency and throughput, with examples from networking and GPUs.",
-    "Write a haiku sequence of five haikus about autumn in a city.",
-    "Write a Python decorator that retries a function up to three times on exception, with exponential backoff.",
-    "How does a transformer language model generate text, step by step?",
-    "Write unit tests in pytest for a function that validates email addresses.",
-    "Explain the Monty Hall problem and why switching is better.",
-    "Write a Makefile for a small C project with a test target.",
-    "What is the difference between TCP and UDP, and when would you choose each?",
-    "Write a Python script that downloads a web page and counts the most common words.",
-    "Explain how garbage collection works in Java, including generations.",
-    "Write a cover letter for a junior data analyst position.",
-    "Implement a stack using two queues in Python and explain the complexity.",
-    "Explain how a bloom filter works and where it is used.",
-    "Write a Lua function that deep-copies a table, handling cycles.",
-    "Explain what inflation is and how central banks respond to it.",
-    "Write a Python asyncio program that fetches three URLs concurrently.",
-    "What are the SOLID principles? Give one example for each.",
-    "Write a function that computes the edit distance between two strings, with dynamic programming.",
-    "Explain how photosynthesis works.",
-    "Write a shell one-liner that counts unique IP addresses in an nginx access log, and explain it.",
-    "Explain the difference between a mutex and a semaphore.",
-    "Write a Python function that converts Roman numerals to integers, with tests.",
-    "Describe how a refrigerator works.",
-    "Write a minimal event emitter class in JavaScript with on, off and emit.",
-    "Explain what a database index is and how a B-tree index speeds up queries.",
-};
-
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_dir = default_model_dir(), ablation, effort = "none", prompts_file, out_file, forced_file;
-  int seqs = 64, slots = 0, ctx = 768, tokens = 512, prefill_chunk = 512;
+  std::string model_dir = default_model_dir(), ablation, effort = "none", out_file, forced_file, oracle_file;
+  // short prompts of the kinds people send (code, explanations, writing, math); repeated when --seqs exceeds them
+  std::string prompts_file = std::string(INGINE_REPO_DIR) + "/bench/prompts-short.json";
+  int seqs = 64, slots = 0, ctx = 768, tokens = 512, prefill_chunk = 512, spec = 0;
   double temperature = 0.0;
   int seed = 1;
-  bool reference = false, ignore_eos = false, kv_fp8 = false;
+  bool reference = false, ignore_eos = false, kv_fp8 = false, accept_all = false;
 
   ingine::serve::ArgParser ap("ingine-batch-bench", "Many requests at once: aggregate decode throughput on one GPU.");
   ap.option("--model-dir", "", "", &model_dir);
@@ -128,7 +62,7 @@ int main(int argc, char** argv) {
   ap.option("--effort", "", "reasoning effort of the chat template", &effort);
   ap.option("--temperature", "", "0 = greedy", &temperature);
   ap.option("--seed", "", "", &seed);
-  ap.option("--prompts", "", "JSON array of prompt strings (default: 64 built-in short prompts)", &prompts_file);
+  ap.option("--prompts", "", "JSON array of prompt strings (default: bench/prompts-short.json)", &prompts_file);
   ap.option("--out", "", "write every request's output tokens and text to FILE (JSON)", &out_file);
   ap.flag("--ignore-eos", "always generate --tokens tokens", &ignore_eos);
   ap.flag("--kv-fp8", "FP8 full-attention caches", &kv_fp8);
@@ -136,15 +70,26 @@ int main(int argc, char** argv) {
   ap.option("--forced", "",
             "feed the output tokens of FILE (another run's --out) and report where this run's argmax differs from them",
             &forced_file);
+  ap.option("--spec", "", "speculative decoding: verify K drafts per sequence and step (greedy; 0 = off)", &spec);
+  ap.option("--oracle", "", "with --spec: the drafts are the output tokens of FILE (another run's --out)", &oracle_file);
+  ap.flag("--accept-all", "with --spec, timing only: keep every verified row (the drafts are copies of the anchor)",
+          &accept_all);
   ap.parse(argc, argv);
   if (slots == 0) slots = seqs;
+  if (spec < 0 || spec > 7 || (spec > 0 && (!forced_file.empty() || reference || temperature > 0)) ||
+      (!oracle_file.empty() && accept_all) || ((accept_all || !oracle_file.empty()) && spec == 0)) {
+    std::fprintf(stderr, "--spec K: K in 0..7, greedy, not with --forced or --reference; --oracle or --accept-all need it\n");
+    return 2;
+  }
 
   try {
     namespace m = ingine::model;
-    std::vector<std::string> prompts = kPrompts;
-    if (!prompts_file.empty()) {
+    std::vector<std::string> prompts;
+    {
       std::ifstream f(prompts_file);
+      if (!f) throw std::runtime_error("cannot open " + prompts_file);
       prompts = nlohmann::json::parse(f).get<std::vector<std::string>>();
+      if (prompts.empty()) throw std::runtime_error(prompts_file + ": no prompts");
     }
     const auto fmt = ingine::text::ChatFormat::load(model_dir);
     const auto& tok = fmt.tokenizer();
@@ -156,8 +101,9 @@ int main(int argc, char** argv) {
       const nlohmann::ordered_json messages =
           nlohmann::ordered_json::array({{{"role", "user"}, {"content", prompts[std::size_t(b) % prompts.size()]}}});
       ids[b] = fmt.render(messages, nlohmann::ordered_json(), chat).ids;
-      if (int(ids[b].size()) + tokens > ctx) {
-        std::fprintf(stderr, "prompt %d: %zu tokens + %d output tokens exceed --ctx %d\n", b, ids[b].size(), tokens, ctx);
+      if (int(ids[b].size()) + tokens + spec > ctx) {
+        std::fprintf(stderr, "prompt %d: %zu tokens + %d output tokens + %d drafts exceed --ctx %d\n", b, ids[b].size(),
+                     tokens, spec, ctx);
         return 2;
       }
     }
@@ -173,6 +119,17 @@ int main(int argc, char** argv) {
           throw std::runtime_error("--forced: request " + std::to_string(b) + " has another prompt");
         forced.push_back(r.at("tokens").get<std::vector<std::int32_t>>());
         if (forced.back().empty()) throw std::runtime_error("--forced: request " + std::to_string(b) + " is empty");
+      }
+    }
+    std::vector<std::vector<std::int32_t>> oracle;
+    if (!oracle_file.empty()) {
+      std::ifstream f(oracle_file);
+      const auto j = nlohmann::json::parse(f);
+      for (int b = 0; b < seqs; ++b) {
+        const auto& r = j.at("requests").at(b);
+        if (r.at("prompt").get<std::string>() != prompts[std::size_t(b) % prompts.size()])
+          throw std::runtime_error("--oracle: request " + std::to_string(b) + " has another prompt");
+        oracle.push_back(r.at("tokens").get<std::vector<std::int32_t>>());
       }
     }
     // forced: (request, output index, margin) of every position where this run's argmax is not the forced token;
@@ -239,7 +196,7 @@ int main(int argc, char** argv) {
       m::Ablation abl = m::load_ablation(ablation);
       m::BatchState st = m::make_batch_state(slots, ctx, kv_fp8);
       m::Prefiller pf(w, abl, prefill_chunk, stream);
-      m::BatchDecoder dec(w, abl, st, seqs, stream);
+      m::BatchDecoder dec(w, abl, st, seqs, stream, spec + 1);
       ingine::DeviceBuffer chunk(std::size_t(prefill_chunk) * 4), logits(std::size_t(m::UNPADDED_VOCAB) * 4), first(4);
       CUDA_CHECK(cudaStreamSynchronize(stream));
       std::size_t free1 = 0;
@@ -285,24 +242,32 @@ int main(int argc, char** argv) {
         const bool more = forced.empty() ? tokens > 1 && (ignore_eos || last[b] != end_id) : forced[b].size() > 1;
         if (more) active.push_back(b);
       }
-      std::vector<std::int32_t> in_tok, in_slot;
+      // --spec K: rows [anchor, K drafts] per sequence; the longest prefix of drafts equal to the target's argmax is
+      // accepted, then the target's token after it (greedy speculative decoding). Drafts: --oracle FILE's tokens at
+      // those positions, or (--accept-all, timing only) copies of the anchor with every row kept
+      const int M = spec + 1;
+      auto draft_of = [&](int b, int k) -> std::int32_t {
+        const std::size_t at = out[b].size() + std::size_t(k);
+        return !oracle.empty() && at < oracle[b].size() ? oracle[b][at] : out[b].back();
+      };
+      std::vector<std::int32_t> in_tok, in_slot, keep;
       std::vector<std::int64_t> in_pos;
       std::vector<double> step_s;
       std::vector<int> step_n;
+      std::size_t drafts_accepted = 0;
       const auto t_dec = Clock::now();
       std::uint64_t step_index = 0;
       while (!active.empty()) {
-        in_tok.clear(), in_slot.clear(), in_pos.clear();
+        in_tok.clear(), in_slot.clear(), in_pos.clear(), keep.clear();
         for (int b : active) {
           in_tok.push_back(out[b].back());
+          for (int k = 0; k < spec; ++k) in_tok.push_back(draft_of(b, k));
           in_slot.push_back(b);
-          in_pos.push_back(std::int64_t(ids[b].size() + out[b].size() - 1));  // position of the token fed in
+          in_pos.push_back(std::int64_t(ids[b].size() + out[b].size() - 1));  // position of the anchor
         }
         const auto ts = Clock::now();
-        const auto got = dec.step(int(active.size()), in_tok.data(), in_slot.data(), in_pos.data(), float(temperature),
-                                  std::uint64_t(seed) * 0x9E3779B97F4A7C15ull + ++step_index);
-        step_s.push_back(since(ts));
-        step_n.push_back(int(active.size()));
+        const auto got = dec.step(int(active.size()), M, in_tok.data(), in_slot.data(), in_pos.data(),
+                                  float(temperature), std::uint64_t(seed) * 0x9E3779B97F4A7C15ull + ++step_index);
         std::vector<int> still;
         for (std::size_t i = 0; i < active.size(); ++i) {
           const int b = active[i];
@@ -318,15 +283,32 @@ int main(int argc, char** argv) {
             if (out[b].size() < forced[b].size()) still.push_back(b);
             continue;
           }
-          out[b].push_back(got[i]);
-          if (int(out[b].size()) < tokens && (ignore_eos || got[i] != end_id)) still.push_back(b);
+          const std::int32_t* row_tok = in_tok.data() + i * M;
+          const std::int32_t* row_got = got.data() + i * M;
+          int a = 0;
+          if (accept_all) a = spec;
+          else
+            while (a < spec && row_tok[1 + a] == row_got[a]) ++a;
+          drafts_accepted += std::size_t(a);
+          keep.push_back(a + 1);
+          bool finished = false;
+          for (int k = 0; k <= a && !finished; ++k) {  // the accepted drafts, then the target's token after them
+            const std::int32_t t = k < a ? row_tok[1 + k] : row_got[a];
+            out[b].push_back(t);
+            finished = int(out[b].size()) >= tokens || (!ignore_eos && t == end_id);
+          }
+          if (!finished) still.push_back(b);
         }
+        if (M > 1) dec.rollback(keep.data());
+        step_s.push_back(since(ts));
+        step_n.push_back(int(active.size()));
         active.swap(still);
       }
       const double decode_s = since(t_dec), wall = since(t0);
-      std::size_t total_out = 0, decode_out = 0;
+      std::size_t total_out = 0, seq_steps = 0;
       for (int b = 0; b < seqs; ++b) total_out += out[b].size();
-      for (int n : step_n) decode_out += std::size_t(n);
+      for (int n : step_n) seq_steps += std::size_t(n);
+      const std::size_t decode_out = total_out - std::size_t(seqs);  // the first tokens come from the prefill
       std::vector<double> full_steps;
       for (std::size_t i = 0; i < step_s.size(); ++i)
         if (step_n[i] == seqs) full_steps.push_back(step_s[i]);
@@ -335,6 +317,9 @@ int main(int argc, char** argv) {
       std::printf("batch: %d requests, %zu output tokens (%zu steps, %.1f ms per step with all %d)\n", seqs, total_out,
                   step_s.size(), full_step_ms, seqs);
       std::printf("batch: prefill %.2fs, decode %.2fs (%.1f tok/s)\n", prefill_s, decode_s, double(decode_out) / decode_s);
+      if (spec > 0)
+        std::printf("spec: %d drafts per step, %.3f tokens per sequence and step (%.3f drafts accepted)\n", spec,
+                    double(decode_out) / double(seq_steps), double(drafts_accepted) / double(seq_steps));
       std::printf("AGGREGATE %.1f tok/s (%zu output tokens / %.2fs from the first prefill to the last token)\n",
                   double(total_out) / wall, total_out, wall);
       report["mode"] = "batch";

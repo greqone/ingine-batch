@@ -110,10 +110,13 @@ void reset_slot(BatchState& st, int s, cudaStream_t stream) {
 
 // ------------------------------------------------------------------------------------------------ decoder
 
-BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st, int max_seqs, cudaStream_t stream)
-    : w_(w), abl_(abl), st_(st), max_seqs_(max_seqs), stream_(stream), gemm_(std::make_unique<pk::Gemm>()) {
+BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st, int max_seqs, cudaStream_t stream,
+                           int max_m)
+    : w_(w), abl_(abl), st_(st), max_seqs_(max_seqs), max_m_(max_m), stream_(stream),
+      gemm_(std::make_unique<pk::Gemm>()) {
   if (max_seqs < 1 || max_seqs > st.slots) throw std::invalid_argument("BatchDecoder: max_seqs must be in 1..slots");
-  const std::size_t N = std::size_t(max_seqs);
+  if (max_m < 1 || max_m > 8) throw std::invalid_argument("BatchDecoder: max_m must be in 1..8");
+  const std::size_t S = std::size_t(max_seqs), N = S * std::size_t(max_m);  // sequences, rows
   auto alloc = [&](std::size_t bytes) {
     storage_.emplace_back(bytes);
     return storage_.back().p;
@@ -122,8 +125,9 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   auto bf16 = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
   auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
   auto i64 = [&](std::size_t n) { return static_cast<std::int64_t*>(alloc(n * 8)); };
-  tokens_ = i32(N), slots_ = i32(N), sampled_ = i32(N);
-  pos_ = i64(N), ids_ = i64(N);
+  tokens_ = i32(N), slots_ = i32(S), sampled_ = i32(N);
+  temps_ = f32(N);
+  pos_ = i64(S), ids_ = i64(N);
   B0_ = f32(N * H), B1_ = f32(N * H);
   for (int p = 0; p < PASSES; ++p) B2_[p] = f32(N * H), E_[p] = f32(N * H);
   hid_ = f32(N * H), part_ = f32(N * H), y_ = f32(N * H), y2_ = f32(N * H);
@@ -136,15 +140,23 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   router_logits_ = f32(N * EXPERTS), wts_ = f32(N * TOP_K);
   idx_ = i32(N * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(N * TOP_K), pair_dst_ = i32(N * TOP_K);
-  tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_seqs)) * sizeof(int4)));
+  tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(int(N))) * sizeof(int4)));
   act_ = bf16(N * TOP_K * INTER), down_ = bf16(N * TOP_K * H), moe_sum_ = bf16(N * H);
   logits_ = f32(N * LD_V);
   // FP8 dense rows (dense_fp8): dequantized per visit as the Prefiller does
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
+  if (max_m > 1) {
+    taps_ = bf16(N * NUM_TAPS * H);
+    hist_k_ = bf16(NUM_VISITS * N * KV_DIM), hist_v_ = bf16(NUM_VISITS * N * KV_DIM);
+    hist_attn_ = bf16(NUM_VISITS * N * H), hist_mlp_ = bf16(NUM_VISITS * N * H);
+    conv_backup_ = f32(S * std::size_t(kb::conv_backup_floats()));
+    commit_ = i32(S);
+  }
   for (auto& b : storage_) b.fill(0);
-  attn_ws_ = DeviceBuffer(attn::workspace_bytes(1, max_seqs));
+  attn_ws_ = DeviceBuffer(attn::workspace_bytes(max_m, max_seqs));
   attn_ws_.fill(0);  // the kernel resets its counters itself
   sampled_host_.resize(N);
+  temps_host_.resize(N);
 }
 
 BatchDecoder::~BatchDecoder() = default;
@@ -165,16 +177,35 @@ const float* const* BatchDecoder::block_table(const std::vector<const float*>& b
   return static_cast<const float* const*>(it->second.p);
 }
 
-std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* tokens, const std::int32_t* slots,
-                                                 const std::int64_t* pos, float temperature, std::uint64_t seed) {
+kb::ConvStates BatchDecoder::conv_states() const {
+  const State s0 = st_.view(0);
+  return {static_cast<float*>(s0.conv_k.data),    static_cast<float*>(s0.conv_v.data),
+          static_cast<float*>(s0.conv_attn.data), static_cast<float*>(s0.conv_mlp.data),
+          st_.conv_kv_stride(),                   st_.conv_h_stride()};
+}
+
+void BatchDecoder::rollback(const std::int32_t* commit) {
+  if (last_m_ <= 1) return;  // a plain step keeps every row
+  for (int b = 0; b < last_n_; ++b)
+    if (commit[b] < 1 || commit[b] > last_m_) throw std::invalid_argument("BatchDecoder::rollback: commit outside 1..M");
+  CUDA_CHECK(cudaMemcpyAsync(commit_, commit, std::size_t(last_n_) * 4, cudaMemcpyHostToDevice, stream_));
+  kb::conv_rollback(conv_states(), last_n_, slots_, conv_backup_, {hist_k_, hist_v_, hist_attn_, hist_mlp_}, last_m_,
+                    commit_, stream_);
+}
+
+std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_t* tokens, const std::int32_t* slots,
+                                                 const std::int64_t* pos, const float* temperature, std::uint64_t seed) {
   if (n < 1 || n > max_seqs_) throw std::invalid_argument("BatchDecoder::step: n outside 1..max_seqs");
+  if (M < 1 || M > max_m_) throw std::invalid_argument("BatchDecoder::step: M outside 1..max_m");
   for (int b = 0; b < n; ++b) {
     if (slots[b] < 0 || slots[b] >= st_.slots) throw std::invalid_argument("BatchDecoder::step: slot out of range");
-    if (pos[b] < 0 || pos[b] >= st_.ctx) throw std::invalid_argument("BatchDecoder::step: position outside the slot context");
+    if (pos[b] < 0 || pos[b] + M > st_.ctx)
+      throw std::invalid_argument("BatchDecoder::step: positions outside the slot context");
   }
   const Weights& w = w_;
   const cudaStream_t s = stream_;
-  const int T = n;  // rows: one per sequence
+  const int T = n * M;  // rows: M per sequence
+  const bool verify = M > 1;  // keep taps, conv inputs and the overwritten conv rows (max_m > 1)
   const std::size_t slab = std::size_t(T) * H;
   const float* attn_dirs = f32p(abl_.attn_dirs);
   const float* attn_w = f32p(abl_.attn_w);
@@ -182,9 +213,13 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
   const float* mlp_w = f32p(abl_.mlp_w);
   const State s0 = st_.view(0);  // per-visit base pointers; sequence b's slot adds slots[b] * stride
 
-  CUDA_CHECK(cudaMemcpyAsync(tokens_, tokens, std::size_t(n) * 4, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(tokens_, tokens, std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(slots_, slots, std::size_t(n) * 4, cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(pos_, pos, std::size_t(n) * 8, cudaMemcpyHostToDevice, s));
+  for (int r = 0; r < T; ++r) temps_host_[std::size_t(r)] = temperature[r / M];
+  CUDA_CHECK(cudaMemcpyAsync(temps_, temps_host_.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
+  last_n_ = n, last_m_ = M;
+  if (verify) kb::conv_save(conv_states(), n, slots_, conv_backup_, s);
 
   auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
                  const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
@@ -229,7 +264,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
 
   pk::widen_ids(tokens_, T, ids_, IMAGE_PLACEHOLDER_ID, s);
   dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
-  int prev_v = -1;
+  int prev_v = -1, tap = 0;
 
   for (int v = 0; v < NUM_VISITS; ++v) {
     const int l = VISITS[v].layer, p = VISITS[v].pass;
@@ -274,6 +309,10 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
       mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
           f32p(layer.attn_norm_mix), xin_, nullptr);
     }
+    if (tap < 3 && v == TAP_VISITS[tap]) {
+      if (verify) pk::store_tap(hid, T, taps_ + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, s);
+      ++tap;
+    }
 
     // ---- projections (fast.proj_layout): one GEMM for a single input, else per input segment; BF16-rounded,
     // then the FP32 rows the decode attention kernel reads
@@ -298,11 +337,14 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
       }
     }
     kb::widen(proj16_, R, T, R, proj32_, R, s);
+    if (verify)  // the k/v conv inputs (engine._rollback's history)
+      kb::keep_kv(proj16_, R, T, SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], hist_k_ + std::size_t(v) * T * KV_DIM,
+                  hist_v_ + std::size_t(v) * T * KV_DIM, s);
 
     // ---- attention: every sequence over its own slot
     attn::DecodeArgs a;
     a.proj = proj32_;
-    a.M = 1;
+    a.M = M;
     a.q_scale = f32p(layer.q_scale);
     a.r_scale = f32p(layer.r_scale);
     a.rel_proj = f32p(layer.rel_proj);
@@ -312,7 +354,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
     a.workspace = attn_ws_.p;
     a.workspace_size = attn_ws_.bytes;
     a.out = attn_out_;
-    a.batch = T;
+    a.batch = n;
     a.slots = slots_;
     a.conv_stride = st_.conv_kv_stride();
     if (layer.full) {
@@ -343,10 +385,11 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
     }
     attn::attn_decode(a, s);
 
-    // ---- output projection + post-attention conv (each slot's state)
-    gemm_->run(attn_out_, HEADS * HEAD_DIM, bf16_rows(layer.wo), HEADS * HEAD_DIM, wo_out_, H, false, T, H,
+    // ---- output projection + post-attention conv (each slot's state); a verify keeps the conv inputs
+    __nv_bfloat16* const wo_dst = verify ? hist_attn_ + std::size_t(v) * slab : wo_out_;
+    gemm_->run(attn_out_, HEADS * HEAD_DIM, bf16_rows(layer.wo), HEADS * HEAD_DIM, wo_dst, H, false, T, H,
                HEADS * HEAD_DIM, s);
-    kb::conv(wo_out_, H, T, 1, H, f32p(layer.attn_conv), s0.conv_attn_at(v), st_.conv_h_stride(), slots_, y_, s);
+    kb::conv(wo_dst, H, n, M, H, f32p(layer.attn_conv), s0.conv_attn_at(v), st_.conv_h_stride(), slots_, y_, s);
 
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
     std::vector<const float*> mlp_blocks = blocks;
@@ -374,14 +417,18 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
                             f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
     pk::moe_gate_up(me, xm_, T, work, act_, s);
     pk::moe_down(me, act_, T, work, down_, s);
-    pk::moe_combine(down_, wts_, T, moe_sum_, s);
-    kb::conv(moe_sum_, H, T, 1, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, y2_, s);
+    __nv_bfloat16* const moe_dst = verify ? hist_mlp_ + std::size_t(v) * slab : moe_sum_;
+    pk::moe_combine(down_, wts_, T, moe_dst, s);
+    kb::conv(moe_dst, H, n, M, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, y2_, s);
     prev_v = v;
   }
 
-  // ---- final read, the head of every row, one token per row
+  // ---- final read, taps, the head of every row, one token per row
   mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
       f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
+  if (verify)
+    CUDA_CHECK(cudaMemcpy2DAsync(taps_ + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
+                                 std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
   if (w.unembed.fp8()) {  // model.logits row by row (FP8 rows dequantized in the kernel)
     for (int b = 0; b < T; ++b)
       pk::head_logits(xf_ + std::size_t(b) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB,
@@ -389,10 +436,10 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
   } else {
     gemm_->run(xf_, H, bf16p(w.unembed.w), H, logits_, LD_V, true, T, UNPADDED_VOCAB, H, s);
   }
-  kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, logits_raw(), temperature, seed, sampled_, s);
-  CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled_, std::size_t(n) * 4, cudaMemcpyDeviceToHost, s));
+  kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, logits_raw(), temps_, seed, sampled_, s);
+  CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled_, std::size_t(T) * 4, cudaMemcpyDeviceToHost, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
-  return {sampled_host_.data(), std::size_t(n)};
+  return {sampled_host_.data(), std::size_t(T)};
 }
 
 }  // namespace ingine::model

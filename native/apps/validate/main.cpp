@@ -62,6 +62,7 @@ struct Args {
   bool generate = false;
   bool spec = false;   // --generate / --path with DSpark speculative decoding
   bool batch = false;  // --batch: the pieces through the batched decoder, every case of a group at once
+  int width = 1;       // --width M: with --batch, speculative verify steps of M rows with rejected rows
   int dense_fp8 = -1;  // --dense-bf16 / --dense-fp8: the dense rows the C++ side runs (default: the goldens')
   int path_tokens = 0;        // --path N
   double tie_margin = 0.5;    // --tie-margin X
@@ -74,11 +75,13 @@ struct Args {
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
-      "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--batch] [--dense-bf16 | --dense-fp8]\n"
+      "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--batch [--width M]]\n"
+      "                       [--dense-bf16 | --dense-fp8]\n"
       "                       [--max-kl X] [--max-mean-kl X] [--min-top1 F]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
       "plain-projection file the goldens of the abliterated model were made with. --batch runs the pieces through the\n"
-      "batched decoder (model/batch.h): every case of a configuration in its own slot, decoded together\n");
+      "batched decoder (model/batch.h): every case of a configuration in its own slot, decoded together; --width M\n"
+      "(2..8) verifies M rows per step, rejects some of them and rolls back (speculative decoding)\n");
 }
 
 struct Stage {
@@ -176,9 +179,13 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
 }
 
 // The pieces through the batched decoder: each case's prompt prefilled into its own slot (chunked as the goldens
-// were), then the golden greedy tokens teacher forced through batched steps, every case one row of the same step at
-// its own position; per stage the same comparison as run_pieces.
-void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, Totals& tot) {
+// were), then the golden greedy tokens teacher forced through batched steps, every case at its own position; per
+// stage the same comparison as run_pieces. width > 1: speculative verify steps of `width` rows per case; of each
+// block a case keeps c rows (c = 1 + (block + case) % width, cycling through every count), the golden tokens, and
+// the rows after them carry wrong tokens; the decoder rolls each case back to its c rows, and the next block starts
+// at the first rejected position. Only kept rows are compared, so every golden step is compared exactly once,
+// after all rollbacks before it.
+void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, int width, Totals& tot) {
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   {
@@ -187,12 +194,12 @@ void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cas
     const int n = int(cases.size());
     int ctx = 2, steps = 1 << 30;
     for (const auto& c : cases) {
-      ctx = std::max(ctx, int(c.at("prompt_ids").size() + c.at("decode").size()) + 1);
+      ctx = std::max(ctx, int(c.at("prompt_ids").size() + c.at("decode").size()) + width + 1);
       steps = std::min(steps, int(c.at("decode").size()));
     }
     BatchState st = make_batch_state(n, ctx, opt.kv_fp8);
     Prefiller prefiller(w, abl, opt.prefill_chunk, stream);
-    BatchDecoder dec(w, abl, st, n, stream);
+    BatchDecoder dec(w, abl, st, n, stream, width);
     DeviceBuffer tokens(std::size_t(opt.prefill_chunk) * 4), logits(std::size_t(UNPADDED_VOCAB) * 4);
     std::vector<float> host(UNPADDED_VOCAB);
     auto fetch = [&](const float* d, bool raw) {
@@ -225,31 +232,43 @@ void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cas
                   c.at("name").get<std::string>().c_str(), ids.size(), pre.kl, pre.top1 ? "ok" : "MISS", pre.max_diff);
     }
     std::vector<double> sum_kl(n), max_kl(n), max_diff(n);
-    std::vector<int> agree(n);
-    std::vector<std::int32_t> in_tok(n), in_slot(n);
-    std::vector<std::int64_t> in_pos(n);
-    for (int k = 0; k < steps; ++k) {
+    std::vector<int> agree(n), done(n);
+    std::vector<std::int32_t> in_tok, in_slot, keep;
+    std::vector<std::int64_t> in_pos;
+    for (int block = 0;; ++block) {
+      in_tok.clear(), in_slot.clear(), keep.clear(), in_pos.clear();
       for (int b = 0; b < n; ++b) {
-        const auto& step = cases[std::size_t(b)].at("decode").at(k);
-        in_tok[b] = step.at("input_token").get<std::int32_t>();
-        in_slot[b] = b;
-        in_pos[b] = step.at("pos").get<std::int64_t>();
+        if (done[b] >= steps) continue;
+        const auto& golden = cases[std::size_t(b)].at("decode");
+        const int c = std::min(1 + (block + b) % width, steps - done[b]);
+        for (int r = 0; r < width; ++r)  // wrong tokens after the kept rows
+          in_tok.push_back(r < c ? golden.at(done[b] + r).at("input_token").get<std::int32_t>() : 1000 + 37 * r + b);
+        in_slot.push_back(b);
+        in_pos.push_back(golden.at(done[b]).at("pos").get<std::int64_t>());
+        keep.push_back(c);
       }
-      dec.step(n, in_tok.data(), in_slot.data(), in_pos.data(), 0.f, 0);
-      for (int b = 0; b < n; ++b) {
-        fetch(dec.logits() + std::size_t(b) * BatchDecoder::kLogitsLd, dec.logits_raw());
-        const Stage s = compare(cases[std::size_t(b)].at("decode").at(k), host);
-        tot.add(s);
-        sum_kl[b] += s.kl;
-        max_kl[b] = std::max(max_kl[b], s.kl);
-        max_diff[b] = std::max(max_diff[b], s.max_diff);
-        agree[b] += s.top1;
+      if (in_slot.empty()) break;
+      const int na = int(in_slot.size());
+      dec.step(na, width, in_tok.data(), in_slot.data(), in_pos.data(), 0.f, 0);
+      for (int i = 0; i < na; ++i) {
+        const int b = in_slot[i];
+        for (int r = 0; r < keep[i]; ++r) {
+          fetch(dec.logits() + std::size_t(i * width + r) * BatchDecoder::kLogitsLd, dec.logits_raw());
+          const Stage s = compare(cases[std::size_t(b)].at("decode").at(done[b] + r), host);
+          tot.add(s);
+          sum_kl[b] += s.kl;
+          max_kl[b] = std::max(max_kl[b], s.kl);
+          max_diff[b] = std::max(max_diff[b], s.max_diff);
+          agree[b] += s.top1;
+        }
       }
+      dec.rollback(keep.data());
+      for (int i = 0; i < na; ++i) done[in_slot[i]] += keep[i];
     }
     for (int b = 0; b < n; ++b)
-      std::printf("%-22s batch   (%2d steps, %d rows): KL mean %.3e max %.3e  top1 %d/%d  max|dlogit| %.4f\n",
-                  cases[std::size_t(b)].at("name").get<std::string>().c_str(), steps, n, sum_kl[b] / steps, max_kl[b],
-                  agree[b], steps, max_diff[b]);
+      std::printf("%-22s batch   (%2d steps, %d cases, width %d): KL mean %.3e max %.3e  top1 %d/%d  max|dlogit| %.4f\n",
+                  cases[std::size_t(b)].at("name").get<std::string>().c_str(), steps, n, width, sum_kl[b] / steps,
+                  max_kl[b], agree[b], steps, max_diff[b]);
   }
   CUDA_CHECK(cudaStreamDestroy(stream));
 }
@@ -376,6 +395,7 @@ int main(int argc, char** argv) {
     else if (k == "--generate") a.generate = true;
     else if (k == "--spec") a.spec = true;
     else if (k == "--batch") a.batch = true;
+    else if (k == "--width") a.width = std::stoi(val());
     else if (k == "--dense-bf16") a.dense_fp8 = 0;
     else if (k == "--dense-fp8") a.dense_fp8 = 1;
     else if (k == "--path") a.path_tokens = std::stoi(val());
@@ -427,7 +447,7 @@ int main(int argc, char** argv) {
                   key.second ? "FP8" : "BF16");
       if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);
       else if (a.generate) run_generate(opt, cases, tot);
-      else if (a.batch) run_batch(opt, cases, tot);
+      else if (a.batch) run_batch(opt, cases, a.width, tot);
       else run_pieces(opt, cases, tot);
     }
     const double top1 = tot.stages ? double(tot.top1) / tot.stages : 0.0;
