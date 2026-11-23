@@ -3,7 +3,10 @@
 
 A round releases N streaming requests together, each on its own connection, then waits for all of them. The round's
 aggregate is the sum of the completion tokens the server reports (stream_options.include_usage) over the wall time
-from the first request sent to the last response ended: "total output tokens/s across N concurrent requests".
+from the first request sent to the last response ended: "total output tokens/s across N concurrent requests" (the
+"concurrent aggregate" of Strata's benchmark protocol). Also reported: the sum of the requests' own decode rates
+((completion tokens - 1) / (last token - first token) per request), the other way concurrent throughput gets
+quoted ("the streams' tok/s added"); it leaves out admission and the round's tail.
 One warm-up request runs before the rounds and is not counted.
 
     python3 bench/concurrent.py --port 8090 --concurrency 64 --max-tokens 512 --rounds 3
@@ -90,7 +93,7 @@ def run_round(args, prompts):
     t1 = max(r[2] for r in results)
     total = sum(r[3] for r in results)
     ttft = [r[1] - r[0] for r in results]
-    per_request = [r[3] / (r[2] - r[1]) for r in results if r[2] > r[1] and r[3] > 1]
+    per_request = [(r[3] - 1) / (r[2] - r[1]) for r in results if r[2] > r[1] and r[3] > 1]
     capped = sum(r[3] >= args.max_tokens for r in results)
     return {
         "output_tokens": total,
@@ -99,6 +102,7 @@ def run_round(args, prompts):
         "ttft_p50_s": statistics.median(ttft),
         "ttft_max_s": max(ttft),
         "request_tps_p50": statistics.median(per_request) if per_request else 0.0,
+        "request_tps_sum": sum(per_request),
         "capped": capped,
         "texts": [r[4] for r in results],
     }
@@ -128,9 +132,12 @@ def main():
         rounds.append(r)
         print(f"round {k + 1}: {r['output_tokens']} output tokens in {r['wall_s']:.2f}s = {r['aggregate_tps']:.1f} tok/s "
               f"({r['capped']}/{args.concurrency} at max_tokens; TTFT p50 {r['ttft_p50_s']:.2f}s max "
-              f"{r['ttft_max_s']:.2f}s; per request p50 {r['request_tps_p50']:.1f} tok/s)")
+              f"{r['ttft_max_s']:.2f}s; per request p50 {r['request_tps_p50']:.1f} tok/s, sum of the requests' rates "
+              f"{r['request_tps_sum']:.1f} tok/s)")
     agg = statistics.median(r["aggregate_tps"] for r in rounds)
-    print(f"MEDIAN AGGREGATE {agg:.1f} tok/s over {args.rounds} rounds of {args.concurrency} concurrent requests")
+    summed = statistics.median(r["request_tps_sum"] for r in rounds)
+    print(f"MEDIAN AGGREGATE {agg:.1f} tok/s over {args.rounds} rounds of {args.concurrency} concurrent requests "
+          f"(sum of the requests' rates: {summed:.1f} tok/s)")
     if args.out:
         settings = {k: v for k, v in vars(args).items() if k != "out"}
         pathlib.Path(args.out).write_text(json.dumps({"settings": settings, "rounds": rounds}, indent=1) + "\n")
