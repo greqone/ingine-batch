@@ -2,6 +2,8 @@
 ingine_add_test(NAME kernels_dense SOURCES test_dense.cpp LIBS ingine_kernels_dense GPU ORACLE TIMEOUT 600)
 ingine_add_test(NAME kernels_moe SOURCES test_moe.cpp LIBS ingine_kernels_moe GPU ORACLE TIMEOUT 600)
 ingine_add_test(NAME kernels_attn SOURCES test_attn.cpp LIBS ingine_kernels_attn GPU ORACLE TIMEOUT 900)
+# the batched attention kernel against the cluster kernel on batches of 2..64 sequences (~3 GB of GPU memory)
+ingine_add_test(NAME kernels_attn_batch SOURCES test_attn_batch.cu LIBS ingine_kernels_attn GPU TIMEOUT 900)
 ingine_add_test(NAME kernels_head SOURCES test_head.cpp LIBS ingine_kernels_head GPU ORACLE TIMEOUT 600)
 # every output bit of the M-wide weight-streaming and sliding-attention kernels (~1 GB of GPU memory)
 ingine_add_test(NAME kernels_bitlock SOURCES test_bitlock.cpp

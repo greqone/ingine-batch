@@ -111,6 +111,12 @@ log_scaling, workspace, out)`
   from the host; a call with `pos + M > rows` does nothing.
 * Target: close to DRAM bandwidth on the K/V bytes read for long contexts; small fixed overhead for the
   1024-key sliding layers.
+* Batch (`DecodeArgs::batch` > 1, the batched decoder): sequence b has its own position `pos[b]`, rows
+  `b*M .. b*M+M-1` of `proj` and `out`, and the caches, `kpos` and conv states of slot `slots[b]` (pointers
+  of slot 0 plus `slot * stride`). Sliding rings may hold fewer than 1024 rows; such a ring never wraps
+  (`pos + M > rows` does nothing, as for full layers). Same results as one call per sequence: up to
+  accumulation order (BF16 rounding flips of the output), caches, `kpos` and conv states bit-identical.
+  Target at batch 64, M = 1: ≤ 1.3 × the K/V read time + 10 µs per visit.
 
 ## Area `dense` (projections, mixing, router, head)
 

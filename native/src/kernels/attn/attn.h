@@ -43,14 +43,20 @@ struct DecodeArgs {
   std::int64_t cache_stride = 0, kpos_stride = 0, conv_stride = 0;
 };
 
-// Bytes of workspace attn_decode needs for up to max_m tokens of up to max_batch sequences: a counter per
-// sequence (zero the workspace once; the kernel resets its counters itself) and the split partials. One
-// workspace serves every layer of a stream-ordered decode step.
+// Bytes of workspace attn_decode needs for up to max_m tokens of up to max_batch sequences: counters (zero the
+// workspace once; the kernels reset their counters themselves) and the split partials, for whichever kernel
+// attn_decode picks. One workspace serves every layer of a stream-ordered decode step.
 std::size_t workspace_bytes(int max_m, int max_batch = 1);
 
 // How many of the kernel's 16-block clusters (one per KV head, 8 per call) fit on the GPU at once.
 int max_active_clusters(int M, int window);
 
+// batch == 1: the cluster kernel below; batch > 1: the batched kernel (attn_batch.h).
 void attn_decode(const DecodeArgs& a, cudaStream_t stream);
+
+// The 16-block-cluster kernel (one sequence at long context: all 16 x 8 blocks per sequence) at any batch; its
+// workspace: cluster_workspace_bytes(M, batch) (workspace_bytes covers it for batch 1 only).
+void attn_decode_cluster(const DecodeArgs& a, cudaStream_t stream);
+std::size_t cluster_workspace_bytes(int max_m, int max_batch);
 
 }  // namespace ingine::kernels::attn
