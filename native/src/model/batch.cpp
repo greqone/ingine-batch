@@ -8,6 +8,7 @@
 #include "ingine/generator.h"
 #include "kernels/attn/attn.h"
 #include "kernels/batch/batch.h"
+#include "kernels/batch/moe.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
 
@@ -136,7 +137,7 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   router_logits_ = f32(N * EXPERTS), wts_ = f32(N * TOP_K);
   idx_ = i32(N * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(N * TOP_K), pair_dst_ = i32(N * TOP_K);
-  tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_seqs)) * sizeof(int4)));
+  tiles_ = static_cast<int4*>(alloc(std::size_t(kb::moe_tiles_capacity(max_seqs)) * sizeof(int4)));
   act_ = bf16(N * TOP_K * INTER), down_ = bf16(N * TOP_K * H), moe_sum_ = bf16(N * H);
   logits_ = f32(N * LD_V);
   // FP8 dense rows (dense_fp8): dequantized per visit as the Prefiller does
@@ -368,12 +369,12 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* toke
     CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
-    pk::moe_route(idx_, T, work, s);
+    kb::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
     const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
                             f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
-    pk::moe_gate_up(me, xm_, T, work, act_, s);
-    pk::moe_down(me, act_, T, work, down_, s);
+    kb::moe_gate_up(me, xm_, T, work, act_, s);
+    kb::moe_down(me, act_, T, work, down_, s);
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     kb::conv(moe_sum_, H, T, 1, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, y2_, s);
     prev_v = v;

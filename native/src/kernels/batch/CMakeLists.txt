@@ -1,5 +1,6 @@
 add_library(ingine_kernels_batch STATIC
   batch.cu
+  moe.cu
 )
 ingine_cuda_target(ingine_kernels_batch)
 ingine_internal_includes(ingine_kernels_batch)
