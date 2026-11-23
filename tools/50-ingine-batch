@@ -1,0 +1,6 @@
+{
+    "rules": [
+        { "pattern": { "feature": "procname", "matches": "ingine-serve" }, "profile": [ "0x166c5e", 0 ] },
+        { "pattern": { "feature": "procname", "matches": "ingine-batch-bench" }, "profile": [ "0x166c5e", 0 ] }
+    ]
+}
