@@ -14,6 +14,9 @@ namespace ingine::kernels::attn {
 
 struct DecodeArgs {
   const float* proj = nullptr;  // fp32 [M, R]: R = 8600 (sliding) or 8664 (full), SEG order
+  // or the same rows as bf16 (exactly one of proj / proj16; the values are BF16 either way). Batched kernel only
+  // (attn_decode takes it at any batch).
+  const __nv_bfloat16* proj16 = nullptr;
   int M = 1;                    // 1..8
   const float* q_scale = nullptr;   // fp32 [24, 128]
   const float* r_scale = nullptr;   // fp32 [24, 16]
@@ -22,6 +25,10 @@ struct DecodeArgs {
   const float* v_conv = nullptr;
   float* conv_k_state = nullptr;    // fp32 [3, 1024]
   float* conv_v_state = nullptr;
+  // false: read the conv states, do not write the advanced ones back (the new rows are computed as with true;
+  // the caller advances the states itself, e.g. after acceptance). Batched kernel only (attn_decode takes it at
+  // any batch).
+  bool conv_write = true;
   void* k_cache = nullptr;          // [rows, 8, 128] bf16, or float8_e4m3fn (full layers only)
   void* v_cache = nullptr;
   bool cache_fp8 = false;
@@ -56,7 +63,8 @@ std::size_t workspace_bytes(int max_m, int max_batch = 1);
 // How many of the kernel's 16-block clusters (one per KV head, 8 per call) fit on the GPU at once.
 int max_active_clusters(int M, int window);
 
-// batch == 1 without ragged rows: the cluster kernel below; otherwise the batched kernel (attn_batch.h).
+// batch == 1 with fp32 proj, conv_write and no ragged rows: the cluster kernel below; otherwise the batched
+// kernel (attn_batch.h).
 void attn_decode(const DecodeArgs& a, cudaStream_t stream);
 
 // The 16-block-cluster kernel (one sequence at long context: all 16 x 8 blocks per sequence) at any batch; its

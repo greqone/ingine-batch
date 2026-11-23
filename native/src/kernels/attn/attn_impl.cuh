@@ -37,8 +37,9 @@ inline void check_args(const DecodeArgs& a) {
     const bool full = a.window == 0;
     require(a.M >= 1 && a.M <= MAXM, "M must be in 1..8");
     require(a.batch >= 1 && a.batch <= 65535, "batch must be in 1..65535");
-    require(a.proj && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_state &&
-                a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
+    require((a.proj == nullptr) != (a.proj16 == nullptr), "exactly one of proj / proj16");
+    require(a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_state && a.conv_v_state &&
+                a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
     require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides

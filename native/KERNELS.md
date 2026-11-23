@@ -122,6 +122,9 @@ log_scaling, workspace, out)`
   as a uniform call with M = m_b for that sequence (causal among its rows, m_b new cache rows, conv state
   advanced by m_b, `pos + m_b > rows` does nothing). The kernel is the one for M; work past each sequence's
   rows is skipped, so pass M = the largest m_b.
+* `proj16` (bf16, the same rows; instead of the fp32 `proj`) and `conv_write = false` (read the conv states,
+  do not write the advanced ones; the caller advances them, e.g. after acceptance) take the batched kernel at
+  any batch. Results bit-identical to fp32 `proj` / `conv_write = true`.
 
 ## Area `dense` (projections, mixing, router, head)
 

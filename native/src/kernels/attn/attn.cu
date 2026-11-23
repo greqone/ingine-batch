@@ -1084,7 +1084,7 @@ int max_active_clusters(int M, int window) {
 }
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
-    if (a.batch > 1 || a.rows) attn_decode_batched(a, stream);
+    if (a.batch > 1 || a.rows || a.proj16 || !a.conv_write) attn_decode_batched(a, stream);
     else attn_decode_cluster(a, stream);
 }
 
@@ -1093,7 +1093,8 @@ void attn_decode_cluster(const DecodeArgs& a, cudaStream_t stream) {
     const bool full = a.window == 0;
     const int M = a.M;
     require(a.workspace_size >= ws_bytes(M, a.batch), "workspace too small: need cluster_workspace_bytes(M, batch)");
-    require(a.rows == nullptr, "ragged rows need the batched kernel (attn_decode)");
+    require(a.rows == nullptr && a.proj16 == nullptr && a.conv_write,
+            "ragged rows, bf16 proj and conv_write = false need the batched kernel (attn_decode)");
 
     Params p{};
     p.proj = a.proj;
