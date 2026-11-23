@@ -1,0 +1,305 @@
+// Batched decode attention (attn_decode with batch > 1, src/kernels/attn/attn_batch.cu) against the cluster
+// kernel on the same batch (attn_decode_cluster, which test_attn checks against an FP64 oracle). Random
+// inputs; batches of 2, 7 and 64 sequences on a permuted slot table, M = 1, 2, 4, 8, per-sequence positions
+// from {0, 1, 37, 600, 1500, 5000} (+ an offset for later sequences): 1024-row sliding rings (empty, partial,
+// wrapped, with stale speculative entries), 640-row rings that never wrap (positions past them: no-op), and
+// full BF16 / E4M3 caches (rows past each position hold random bytes). Output within two BF16 ulps
+// (accumulation order differs); caches, kpos and conv states bit-identical.
+// `--bench`: kernel time per call at batch 64 (old vs new), sliding and full BF16 layers, M = 1, 4, 8,
+// contexts 64, 300, 640 and 2048, the L2 flushed before every call.
+#include "kernels/oracle.h"
+
+#include "kernels/attn/attn.h"
+#include "kernels/attn/attn_batch.h"
+
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
+
+using namespace ingine::test;
+namespace attn = ingine::kernels::attn;
+
+namespace {
+
+constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, C = HKV * D;
+constexpr int OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_KDYN = 8600;
+cudaStream_t g_stream = nullptr;
+
+__device__ std::uint64_t mix64(std::uint64_t z) {
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
+// cache rows [n_rows][C]: N(0, 1) values as BF16 or E4M3, or random bytes where garbage[row]
+__global__ void fill_kv(std::uint8_t* buf, std::size_t n_rows, int fp8, std::uint64_t seed, const std::uint8_t* garbage) {
+  const std::size_t n = n_rows * C;
+  for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x) {
+    const std::uint64_t h = mix64(seed + 0x9E3779B97F4A7C15ull * (i + 1));
+    if (garbage[i / C]) {
+      if (fp8) buf[i] = std::uint8_t(h);
+      else reinterpret_cast<std::uint16_t*>(buf)[i] = std::uint16_t(h);
+      continue;
+    }
+    const float u1 = float((h >> 40) + 1) * (1.f / 16777217.f), u2 = float(h & 0xffffff) * (1.f / 16777216.f);
+    const float x = sqrtf(-2.f * logf(u1)) * cospif(2.f * u2);
+    if (fp8) buf[i] = __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+    else reinterpret_cast<__nv_bfloat16*>(buf)[i] = __float2bfloat16_rn(x);
+  }
+}
+
+// reads n floats (clean L2 lines: evicts everything else without write-backs)
+__global__ void read_all(const float* p, std::size_t n, float* sink) {
+  float s = 0.f;
+  for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x)
+    s += __ldcg(p + i);
+  if (s == 1234.5f) *sink = s;
+}
+
+enum class Kind { ring, small_ring, full_bf16, full_fp8 };
+
+const char* kind_name(Kind k) {
+  switch (k) {
+    case Kind::ring: return "sliding ring 1024";
+    case Kind::small_ring: return "sliding ring 640";
+    case Kind::full_bf16: return "full bf16";
+    default: return "full fp8";
+  }
+}
+
+// One batch: inputs, both kernels' state copies and arguments.
+struct Batch {
+  int B = 0, M = 0, nslots = 0, rows = 0, R = 0;
+  bool full = false, fp8 = false;
+  std::vector<std::int64_t> pos;
+  std::vector<std::int32_t> slots;
+  std::vector<float> proj, q_scale, r_scale, rel_proj, kconv, vconv, ck0, cv0;
+  std::vector<std::int64_t> kpos0;  // [nslots][rows]
+  std::optional<DeviceArray<float>> dproj, dqs, drs, drp, dkc, dvc;
+  std::optional<DeviceArray<std::int64_t>> dpos;
+  std::optional<DeviceArray<std::int32_t>> dslots;
+  // per kernel (0 = cluster reference, 1 = batched)
+  std::optional<DeviceArray<std::uint8_t>> k[2], v[2], ws[2];
+  std::optional<DeviceArray<float>> ck[2], cv[2];
+  std::optional<DeviceArray<std::int64_t>> kp[2];
+  std::optional<DeviceArray<__nv_bfloat16>> out[2];
+
+  attn::DecodeArgs args(int i) const {
+    attn::DecodeArgs a;
+    a.proj = dproj->get();
+    a.M = M;
+    a.q_scale = dqs->get();
+    a.r_scale = drs->get();
+    a.rel_proj = drp->get();
+    a.k_conv = dkc->get();
+    a.v_conv = dvc->get();
+    a.conv_k_state = ck[i]->get();
+    a.conv_v_state = cv[i]->get();
+    a.k_cache = k[i]->get();
+    a.v_cache = v[i]->get();
+    a.cache_fp8 = fp8;
+    a.cache_rows = rows;
+    a.kpos = full ? nullptr : kp[i]->get();
+    a.pos = dpos->get();
+    a.window = full ? 0 : WIN;
+    a.log_scaling = full;
+    a.workspace = ws[i]->get();
+    a.workspace_size = ws[i]->count;
+    a.out = out[i]->get();
+    a.batch = B;
+    a.slots = dslots->get();
+    a.cache_stride = std::int64_t(rows) * C;
+    a.kpos_stride = rows;
+    a.conv_stride = 3 * C;
+    return a;
+  }
+};
+
+// ring slot positions before the call: in order up to p0 (wrapped once p0 > rows), plus `stale` entries at
+// p0 .. p0 + stale - 1 left by a rejected speculative call
+std::vector<std::int64_t> ring_kpos(int rows, std::int64_t p0, int stale) {
+  std::vector<std::int64_t> kp(rows, -1);
+  for (std::int64_t q = std::max<std::int64_t>(0, p0 - rows); q < p0; ++q) kp[q % rows] = q;
+  for (int i = 0; i < stale; ++i)
+    if (p0 + i < rows || rows == WIN) kp[(p0 + i) % rows] = p0 + i;
+  return kp;
+}
+
+// a batch of pos.size() sequences at positions pos; small rings hold small_rows rows
+void make_batch(Batch& bt, Rng& rng, Kind kind, int M, const std::vector<std::int64_t>& pos, int small_rows = 640) {
+  const int B = int(pos.size());
+  bt.B = B, bt.M = M, bt.nslots = B + 3;
+  bt.full = kind == Kind::full_bf16 || kind == Kind::full_fp8;
+  bt.fp8 = kind == Kind::full_fp8;
+  bt.R = bt.full ? 8664 : 8600;
+  bt.pos = pos;
+  const std::int64_t pmax = *std::max_element(bt.pos.begin(), bt.pos.end());
+  bt.rows = kind == Kind::ring ? WIN : kind == Kind::small_ring ? small_rows : int(pmax) + 24;
+  bt.slots.resize(B);
+  for (int b = 0; b < B; ++b) bt.slots[b] = (b * 7 + 2) % bt.nslots;  // gcd(7, B + 3) = 1: distinct
+  // inputs (as test_attn)
+  bt.proj.resize(std::size_t(B) * M * bt.R);
+  for (std::size_t i = 0; i < bt.proj.size(); ++i) {
+    const int r = int(i % bt.R);
+    double s = 1.0;
+    if (r >= OFF_REL && r < OFF_SINK) s = 3.0;
+    else if (r >= OFF_SINK && r < OFF_K) s = 2.0;
+    else if (r >= OFF_KDYN) s = 0.3;
+    bt.proj[i] = round_bf16(float(rng.normal() * s));
+  }
+  bt.q_scale = randn(rng, HQ * D, 0.3), bt.r_scale = randn(rng, HQ * DREL, 0.3);
+  for (auto& v : bt.q_scale) v = round_bf16(v + 1.f);
+  for (auto& v : bt.r_scale) v = round_bf16(v + 1.f);
+  bt.rel_proj = randn_bf16(rng, DREL * EXT, 0.5);
+  bt.kconv = randn_bf16(rng, 4 * C, 0.3), bt.vconv = randn_bf16(rng, 4 * C, 0.3);
+  bt.ck0 = randn_bf16(rng, std::size_t(bt.nslots) * 3 * C, 1.0), bt.cv0 = randn_bf16(rng, std::size_t(bt.nslots) * 3 * C, 1.0);
+  // slot state: ring positions (stale entries on every third sequence), garbage rows
+  bt.kpos0.assign(std::size_t(bt.nslots) * bt.rows, -1);
+  std::vector<std::uint8_t> garbage(std::size_t(bt.nslots) * bt.rows, 1);
+  for (int b = 0; b < B; ++b) {
+    const int sl = bt.slots[b];
+    if (bt.full) {
+      for (int r = 0; r < std::min<std::int64_t>(bt.pos[b], bt.rows); ++r) garbage[std::size_t(sl) * bt.rows + r] = 0;
+    } else {
+      const auto kp = ring_kpos(bt.rows, bt.pos[b], b % 3 == 2 ? 6 : 0);
+      for (int r = 0; r < bt.rows; ++r) {
+        bt.kpos0[std::size_t(sl) * bt.rows + r] = kp[r];
+        garbage[std::size_t(sl) * bt.rows + r] = kp[r] < 0;
+      }
+    }
+  }
+  bt.dproj.emplace(bt.proj), bt.dqs.emplace(bt.q_scale), bt.drs.emplace(bt.r_scale), bt.drp.emplace(bt.rel_proj);
+  bt.dkc.emplace(bt.kconv), bt.dvc.emplace(bt.vconv);
+  bt.dpos.emplace(bt.pos), bt.dslots.emplace(bt.slots);
+  DeviceArray<std::uint8_t> dg(garbage);
+  const std::size_t n_rows = std::size_t(bt.nslots) * bt.rows, bytes = n_rows * C * (bt.fp8 ? 1 : 2);
+  const std::uint64_t seed = rng.next();
+  for (int i = 0; i < 2; ++i) {
+    bt.k[i].emplace(bytes), bt.v[i].emplace(bytes);
+    fill_kv<<<1024, 256>>>(bt.k[i]->get(), n_rows, bt.fp8, seed, dg.get());
+    fill_kv<<<1024, 256>>>(bt.v[i]->get(), n_rows, bt.fp8, seed ^ 0x5555, dg.get());
+    INGINE_TEST_CUDA(cudaGetLastError());
+    bt.ck[i].emplace(bt.ck0), bt.cv[i].emplace(bt.cv0);
+    bt.kp[i].emplace(bt.kpos0);
+    // the batched call gets a workspace sized for any width and a larger batch (as a decoder allocates it)
+    bt.ws[i].emplace(i ? attn::workspace_bytes(8, B + 1) : attn::cluster_workspace_bytes(M, B));
+    bt.out[i].emplace(std::size_t(B) * M * HQ * D);
+  }
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+}
+
+template <class T>
+std::size_t count_diff(const DeviceArray<T>& a, const DeviceArray<T>& b) {
+  const auto x = a.download(), y = b.download();
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < x.size(); ++i) n += std::memcmp(&x[i], &y[i], sizeof(T)) != 0;
+  return n;
+}
+
+struct Worst {
+  double abs = 0, rel = 0;
+};
+
+bool run(Rng& rng, Kind kind, int B, int M, int phase, Worst& worst) {
+  static const std::vector<std::int64_t> positions = {0, 1, 37, 600, 1500, 5000};
+  std::vector<std::int64_t> pos(B);
+  for (int b = 0; b < B; ++b) pos[b] = positions[(b + phase) % positions.size()] + b / int(positions.size());
+  Batch bt;
+  make_batch(bt, rng, kind, M, pos);
+  int active = 0;  // sequences within capacity
+  for (int b = 0; b < B; ++b) active += kind != Kind::small_ring || pos[b] + M <= bt.rows;
+  attn::attn_decode_cluster(bt.args(0), g_stream);
+  attn::attn_decode(bt.args(1), g_stream);
+  INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
+  INGINE_TEST_CUDA(cudaGetLastError());
+  // output: within two BF16 ulps of the reference (accumulation order differs: rounding flips of bf16(o) and
+  // bf16(o * gate)), plus 2^-12 absolute for values that cancel to near zero (|o| is O(1) per term)
+  const auto ref = bf16_download(*bt.out[0]), got = bf16_download(*bt.out[1]);
+  double max_abs = 0, max_rel = 0;
+  std::size_t bad = 0, off = 0, wi = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const double d = std::fabs(double(got[i]) - ref[i]), r = std::fabs(double(ref[i]));
+    max_abs = std::max(max_abs, d);
+    if (d > 0) ++off;
+    if (d > 0 && d / r > max_rel) max_rel = d / r, wi = i;
+    if (!(d <= r / 64 + 1.0 / 4096)) ++bad;
+  }
+  worst.abs = std::max(worst.abs, max_abs), worst.rel = std::max(worst.rel, max_rel);
+  const std::size_t dk = count_diff(*bt.k[0], *bt.k[1]), dv = count_diff(*bt.v[0], *bt.v[1]);
+  const std::size_t dck = count_diff(*bt.ck[0], *bt.ck[1]), dcv = count_diff(*bt.cv[0], *bt.cv[1]);
+  const std::size_t dkp = bt.full ? 0 : count_diff(*bt.kp[0], *bt.kp[1]);
+  // the call advanced the conv states, unless every sequence was past its cache
+  const std::size_t moved = count_diff(*bt.ck[1], DeviceArray<float>(bt.ck0));
+  const bool ok = bad == 0 && dk == 0 && dv == 0 && dck == 0 && dcv == 0 && dkp == 0 && (moved > 0) == (active > 0);
+  std::printf("%s %s B=%d M=%d phase=%d splits=%d: out max_abs=%.3e max_rel=%.3e (got %.6g ref %.6g) differ=%zu/%zu "
+              "(out of tolerance: %zu); cache k/v bytes differ %zu/%zu, conv k/v %zu/%zu, kpos %zu\n",
+              ok ? "PASS" : "FAIL", kind_name(kind), B, M, phase, attn::batched_splits(B, bt.rows), max_abs, max_rel,
+              double(got[wi]), double(ref[wi]), off, ref.size(), bad, dk, dv, dck, dcv, dkp);
+  return ok;
+}
+
+int bench(int only_m, int only_ctx) {  // 0 = all
+  const double bw = 1.79e12;
+  // before every call: a 192 MB read (twice the L2), then proj (written by the kernel before attention in a step)
+  DeviceArray<float> flush(std::size_t(48) << 20), dummy(1);
+  cudaEvent_t e0, e1;
+  INGINE_TEST_CUDA(cudaEventCreate(&e0));
+  INGINE_TEST_CUDA(cudaEventCreate(&e1));
+  Rng rng(7);
+  std::printf("kernel time per call, batch 64 (us); floor = KV bytes at %.2f TB/s\n", bw / 1e12);
+  for (Kind kind : {Kind::ring, Kind::full_bf16})
+    for (int M : {1, 4, 8})
+      for (int ctx : {64, 300, 640, 2048}) {
+        if ((only_m && M != only_m) || (only_ctx && ctx != only_ctx)) continue;
+        Batch bt;
+        // sliding rings of min(ctx + 16, 1024) rows, as BatchState for contexts up to ctx + 16
+        const Kind k = kind == Kind::ring && ctx + 16 < WIN ? Kind::small_ring : kind;
+        make_batch(bt, rng, k, M, std::vector<std::int64_t>(64, ctx), ctx + 16);
+        double t[2] = {0, 0};
+        constexpr int REPS = 20;
+        for (int rep = 0; rep < REPS + 2; ++rep)
+          for (int i = 0; i < 2; ++i) {
+            read_all<<<680, 256, 0, g_stream>>>(flush.get(), flush.count, dummy.get());
+            read_all<<<680, 256, 0, g_stream>>>(bt.dproj->get(), bt.dproj->count, dummy.get());
+            INGINE_TEST_CUDA(cudaEventRecord(e0, g_stream));
+            if (i == 0) attn::attn_decode_cluster(bt.args(0), g_stream);
+            else attn::attn_decode(bt.args(1), g_stream);
+            INGINE_TEST_CUDA(cudaEventRecord(e1, g_stream));
+            INGINE_TEST_CUDA(cudaEventSynchronize(e1));
+            float ms = 0;
+            INGINE_TEST_CUDA(cudaEventElapsedTime(&ms, e0, e1));
+            if (rep >= 2) t[i] += ms * 1e3 / REPS;
+          }
+        const int keys = kind == Kind::ring ? std::min(ctx, WIN) : ctx;
+        const double floor_us = 64.0 * keys * 4096 / bw * 1e6;
+        std::printf("%-12s M=%d ctx=%5d: old %8.1f  new %8.1f  floor %6.1f  target %6.1f  splits %d\n",
+                    kind == Kind::ring ? "sliding" : "full bf16", M, ctx, t[0], t[1], floor_us, 1.3 * floor_us + 10,
+                    attn::batched_splits(64, bt.rows));
+      }
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (skip_without_gpu()) return kSkip;
+  INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
+  if (argc > 1 && std::string(argv[1]) == "--bench")  // --bench [M [ctx]]
+    return bench(argc > 2 ? std::atoi(argv[2]) : 0, argc > 3 ? std::atoi(argv[3]) : 0);
+  Rng rng(9090);
+  bool ok = true;
+  Worst worst;
+  int phase = 0;
+  for (Kind kind : {Kind::ring, Kind::small_ring, Kind::full_bf16, Kind::full_fp8})
+    for (int B : {2, 7, 64})
+      for (int M : {1, 2, 4, 8}) ok &= run(rng, kind, B, M, phase++ % 6, worst);
+  INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
+  std::printf("worst output difference: abs %.3e rel %.3e\n", worst.abs, worst.rel);
+  std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
+  return ok ? 0 : 1;
+}
