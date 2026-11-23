@@ -9,12 +9,13 @@
 
 namespace ingine::kernels::batch {
 
-// model.static_conv per sequence, with the arithmetic of prefill::static_conv: sequence b's rows continue slot
-// slots[b]'s conv state (fp32 [3, C] at state + slots[b] * slot_stride, oldest row first):
-// out[r, c] = (sum_j w[c, j] * ext[r + j] + x[r, c]) / sqrt(5), ext = [state, the sequence's rows of x];
-// then the state holds the last three inputs. x bf16 [n * M, ld], w fp32 [C, 4], out fp32 [n * M, C].
-void conv(const __nv_bfloat16* x, int ld, int n, int M, int C, const float* w, float* state, std::int64_t slot_stride,
-          const std::int32_t* slots, float* out, cudaStream_t stream);
+// model.static_conv per sequence, with the arithmetic of prefill::static_conv: sequence b's rows [rows[b],
+// rows[b+1]) of x continue slot slots[b]'s conv state (fp32 [3, C] at state + slots[b] * slot_stride, oldest row
+// first): out[r, c] = (sum_j w[c, j] * ext[r + j] + x[r, c]) / sqrt(5), ext = [state, the sequence's rows of x];
+// then the state holds the last three inputs. rows: device int32 [n + 1]; x bf16 [rows[n], ld], w fp32 [C, 4], out
+// fp32 [rows[n], C].
+void conv(const __nv_bfloat16* x, int ld, int n, const std::int32_t* rows, int C, const float* w, float* state,
+          std::int64_t slot_stride, const std::int32_t* slots, float* out, cudaStream_t stream);
 
 // dst[r, c] = float(src[r, c]) for r < rows, c < cols.
 void widen(const __nv_bfloat16* src, int ld_src, int rows, int cols, float* dst, int ld_dst, cudaStream_t stream);
@@ -28,14 +29,14 @@ void sample(const float* logits, int ld, int n, int V, bool raw, const float* te
 void sample(const float* logits, int ld, int n, int V, bool raw, float temperature, std::uint64_t seed,
             std::int32_t* out, cudaStream_t stream);
 
-// Speculative verify of M rows per sequence (engine._rollback, per slot): the conv states of every visit, slot 0's
-// pointers plus slots[b] * stride (elements); fp32 [48, 3, C] per slot, oldest row first.
+// Speculative verify of several rows per sequence (engine._rollback, per slot): the conv states of every visit, slot
+// 0's pointers plus slots[b] * stride (elements); fp32 [48, 3, C] per slot, oldest row first.
 struct ConvStates {
   float *k, *v;        // C = 1024 (the attention's k/v convs)
   float *attn, *mlp;   // C = H (the post-attention and post-MLP convs)
   std::int64_t kv_stride, h_stride;
 };
-// The conv inputs of a verify step: bf16 [48, n * M, C] per conv (the BF16 values the convs read).
+// The conv inputs of a verify step of T rows: bf16 [48, T, C] per conv (the BF16 values the convs read).
 struct ConvHistory {
   __nv_bfloat16 *k, *v, *attn, *mlp;
 };
@@ -47,11 +48,13 @@ void keep_kv(const __nv_bfloat16* proj, int ld, int rows, int k_off, int v_off, 
              __nv_bfloat16* hist_v, cudaStream_t stream);
 // backup fp32 [n, conv_backup_floats()] = rows 1, 2 of slot slots[b]'s conv states (before a verify step).
 void conv_save(const ConvStates& st, int n, const std::int32_t* slots, float* backup, cudaStream_t stream);
-// After a verify step of M rows per sequence that keeps commit[b] (1..M) rows of sequence b: slot slots[b]'s
-// states = rows commit[b] .. commit[b] + 2 of [rows 0..2 before the step, its M inputs] (rows 1, 2 from the
-// backup, the inputs from hist rows b * M ..); nothing where commit[b] == M. commit: device int32 [n].
+// After a verify step of T rows (sequence b's rows [rows[b], rows[b+1]), m_b of them) that keeps commit[b] (1..m_b)
+// rows of sequence b: slot slots[b]'s states = rows commit[b] .. commit[b] + 2 of [rows 0..2 before the step, its
+// m_b inputs] (rows 1, 2 from the backup, the inputs from the history); nothing where commit[b] == m_b.
+// rows, commit: device int32 [n + 1], [n].
 void conv_rollback(const ConvStates& st, int n, const std::int32_t* slots, const float* backup,
-                   const ConvHistory& hist, int M, const std::int32_t* commit, cudaStream_t stream);
+                   const ConvHistory& hist, int T, const std::int32_t* rows, const std::int32_t* commit,
+                   cudaStream_t stream);
 // dst row i = src row rows[i], rows of row_elems bf16 (a multiple of 8); rows: device int32 [count].
 void gather_rows(const __nv_bfloat16* src, int row_elems, const std::int32_t* rows, int count, __nv_bfloat16* dst,
                  cudaStream_t stream);

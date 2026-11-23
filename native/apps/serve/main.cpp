@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, batch = 0, batch_ctx = 4096;
   int batch_spec = 0;
+  double batch_spec_threshold = 0.0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -125,6 +126,10 @@ int main(int argc, char** argv) {
             "--engine; BF16 dense weights, text only, temperature sampling)",
             &batch);
   ap.option("--batch-ctx", "", "positions of a request slot with --batch (prompt and output)", &batch_ctx);
+  ap.option("--batch-spec-threshold", "",
+            "with --batch-spec K: per request, the drafts whose estimated acceptance exceeds this x running/slots (at "
+            "most K; 0 = always K)",
+            &batch_spec_threshold);
   ap.option("--batch-spec", "", "with --batch: DSpark drafts verified per step (1..7; 0 = plain decoding)",
             &batch_spec);
   ap.parse(argc, argv);
@@ -182,6 +187,7 @@ int main(int argc, char** argv) {
         options.slots = batch;
         options.ctx = batch_ctx;
         options.spec = batch_spec;
+        options.spec_threshold = float(batch_spec_threshold);
         options.kv_fp8 = kv_fp8;
         batch_engine = std::make_unique<ingine::model::BatchEngine>(options);
         log.info("batched serving: {} slots of {} positions, {} drafts per step ({:.2f} GB of caches, drafter and "

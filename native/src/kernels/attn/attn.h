@@ -41,6 +41,9 @@ struct DecodeArgs {
   int batch = 1;
   const std::int32_t* slots = nullptr;
   std::int64_t cache_stride = 0, kpos_stride = 0, conv_stride = 0;
+  // ragged rows: device int32 [batch + 1]; sequence b's rows are [rows[b], rows[b+1]) of proj and out (m_b =
+  // rows[b+1] - rows[b], 1..M), at positions pos[b] ..; null: b*M .. b*M+M-1 (every sequence M rows)
+  const std::int32_t* rows = nullptr;
 };
 
 // Bytes of workspace attn_decode needs for up to max_m tokens of up to max_batch sequences: counters (zero the

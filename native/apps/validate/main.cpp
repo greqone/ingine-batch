@@ -63,6 +63,7 @@ struct Args {
   bool spec = false;   // --generate / --path with DSpark speculative decoding
   bool batch = false;  // --batch: the pieces through the batched decoder, every case of a group at once
   int width = 1;       // --width M: with --batch, speculative verify steps of M rows with rejected rows
+  bool ragged = false;  // --ragged: with --width, 1..M rows per case, a different count per case and step
   int dense_fp8 = -1;  // --dense-bf16 / --dense-fp8: the dense rows the C++ side runs (default: the goldens')
   int path_tokens = 0;        // --path N
   double tie_margin = 0.5;    // --tie-margin X
@@ -81,7 +82,8 @@ void usage() {
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
       "plain-projection file the goldens of the abliterated model were made with. --batch runs the pieces through the\n"
       "batched decoder (model/batch.h): every case of a configuration in its own slot, decoded together; --width M\n"
-      "(2..8) verifies M rows per step, rejects some of them and rolls back (speculative decoding)\n");
+      "(2..8) verifies M rows per step, rejects some of them and rolls back (speculative decoding); --ragged gives\n"
+      "each case 1..M rows, a different count per case and step\n");
 }
 
 struct Stage {
@@ -180,12 +182,14 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
 
 // The pieces through the batched decoder: each case's prompt prefilled into its own slot (chunked as the goldens
 // were), then the golden greedy tokens teacher forced through batched steps, every case at its own position; per
-// stage the same comparison as run_pieces. width > 1: speculative verify steps of `width` rows per case; of each
-// block a case keeps c rows (c = 1 + (block + case) % width, cycling through every count), the golden tokens, and
-// the rows after them carry wrong tokens; the decoder rolls each case back to its c rows, and the next block starts
-// at the first rejected position. Only kept rows are compared, so every golden step is compared exactly once,
-// after all rollbacks before it.
-void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, int width, Totals& tot) {
+// stage the same comparison as run_pieces. width > 1: speculative verify steps of `width` rows per case (ragged:
+// m = 1 + (block + 2 case + 1) % width rows, a different count per case and block); of each block a case keeps c of
+// its rows (c = 1 + (block + case) % m, cycling through every count), the golden tokens, and the rows after them
+// carry wrong tokens; the decoder rolls each case back to its c rows, and the next block starts at the first
+// rejected position. Only kept rows are compared, so every golden step is compared exactly once, after all
+// rollbacks before it.
+void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, int width, bool ragged,
+               Totals& tot) {
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   {
@@ -233,27 +237,30 @@ void run_batch(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cas
     }
     std::vector<double> sum_kl(n), max_kl(n), max_diff(n);
     std::vector<int> agree(n), done(n);
-    std::vector<std::int32_t> in_tok, in_slot, keep;
+    std::vector<std::int32_t> in_tok, in_slot, keep, rows, first_row;
     std::vector<std::int64_t> in_pos;
     for (int block = 0;; ++block) {
-      in_tok.clear(), in_slot.clear(), keep.clear(), in_pos.clear();
+      in_tok.clear(), in_slot.clear(), keep.clear(), in_pos.clear(), rows.clear(), first_row.clear();
       for (int b = 0; b < n; ++b) {
         if (done[b] >= steps) continue;
         const auto& golden = cases[std::size_t(b)].at("decode");
-        const int c = std::min(1 + (block + b) % width, steps - done[b]);
-        for (int r = 0; r < width; ++r)  // wrong tokens after the kept rows
+        const int m = ragged ? 1 + (block + 2 * b + 1) % width : width;
+        const int c = std::min(1 + (block + b) % m, steps - done[b]);
+        first_row.push_back(int(in_tok.size()));
+        for (int r = 0; r < m; ++r)  // wrong tokens after the kept rows
           in_tok.push_back(r < c ? golden.at(done[b] + r).at("input_token").get<std::int32_t>() : 1000 + 37 * r + b);
         in_slot.push_back(b);
         in_pos.push_back(golden.at(done[b]).at("pos").get<std::int64_t>());
         keep.push_back(c);
+        rows.push_back(m);
       }
       if (in_slot.empty()) break;
       const int na = int(in_slot.size());
-      dec.step(na, width, in_tok.data(), in_slot.data(), in_pos.data(), 0.f, 0);
+      dec.step(na, rows.data(), in_tok.data(), in_slot.data(), in_pos.data(), std::vector<float>(na, 0.f).data(), 0);
       for (int i = 0; i < na; ++i) {
         const int b = in_slot[i];
         for (int r = 0; r < keep[i]; ++r) {
-          fetch(dec.logits() + std::size_t(i * width + r) * BatchDecoder::kLogitsLd, dec.logits_raw());
+          fetch(dec.logits() + std::size_t(first_row[i] + r) * BatchDecoder::kLogitsLd, dec.logits_raw());
           const Stage s = compare(cases[std::size_t(b)].at("decode").at(done[b] + r), host);
           tot.add(s);
           sum_kl[b] += s.kl;
@@ -396,6 +403,7 @@ int main(int argc, char** argv) {
     else if (k == "--spec") a.spec = true;
     else if (k == "--batch") a.batch = true;
     else if (k == "--width") a.width = std::stoi(val());
+    else if (k == "--ragged") a.ragged = true;
     else if (k == "--dense-bf16") a.dense_fp8 = 0;
     else if (k == "--dense-fp8") a.dense_fp8 = 1;
     else if (k == "--path") a.path_tokens = std::stoi(val());
@@ -447,7 +455,7 @@ int main(int argc, char** argv) {
                   key.second ? "FP8" : "BF16");
       if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);
       else if (a.generate) run_generate(opt, cases, tot);
-      else if (a.batch) run_batch(opt, cases, a.width, tot);
+      else if (a.batch) run_batch(opt, cases, a.width, a.ragged, tot);
       else run_pieces(opt, cases, tot);
     }
     const double top1 = tot.stages ? double(tot.top1) / tot.stages : 0.0;

@@ -47,10 +47,11 @@ std::string default_model_dir() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_dir = default_model_dir(), ablation, effort = "none", out_file, forced_file, oracle_file;
+  std::string model_dir = default_model_dir(), ablation, effort = "none", out_file, forced_file, oracle_file, spec_trace;
   // short prompts of the kinds people send (code, explanations, writing, math); repeated when --seqs exceeds them
   std::string prompts_file = std::string(INGINE_REPO_DIR) + "/bench/prompts-short.json";
   int seqs = 64, slots = 0, ctx = 768, tokens = 512, prefill_chunk = 512, spec = 0;
+  double spec_threshold = 0.0;
   double temperature = 0.0;
   int seed = 1;
   bool reference = false, ignore_eos = false, kv_fp8 = false, accept_all = false;
@@ -75,7 +76,13 @@ int main(int argc, char** argv) {
             "feed the output tokens of FILE (another run's --out) and report where this run's argmax differs from them",
             &forced_file);
   ap.option("--spec", "", "speculative decoding: verify K DSpark drafts per sequence and step (0 = off)", &spec);
+  ap.option("--spec-threshold", "",
+            "with --spec: per sequence, the drafts whose estimated acceptance exceeds this x running/slots (at most K; "
+            "0 = always K)",
+            &spec_threshold);
   ap.option("--oracle", "", "with --spec: the drafts are the output tokens of FILE (another run's --out)", &oracle_file);
+  ap.option("--spec-trace", "", "with --spec: write the drafts verified, accepted and their confidences per step to FILE",
+            &spec_trace);
   ap.flag("--accept-all", "with --spec, timing only: keep every verified row (the drafts are copies of the anchor)",
           &accept_all);
   ap.parse(argc, argv);
@@ -202,6 +209,8 @@ int main(int argc, char** argv) {
       options.prefill_chunk = prefill_chunk;
       options.spec = spec;
       options.kv_fp8 = kv_fp8;
+      options.spec_trace = spec_trace;
+      options.spec_threshold = float(spec_threshold);
       m::BatchEngine engine(options);
       std::size_t free1 = 0;
       cudaMemGetInfo(&free1, &total);
@@ -255,7 +264,9 @@ int main(int argc, char** argv) {
                   "with all %d)\n", seqs, total_out, prefill_s, decode_s, step_s.size(), full ? full_ms / full : 0.0,
                   seqs);
       if (spec > 0)
-        std::printf("spec: %d drafts per step, %.3f tokens per sequence and step (%.3f drafts accepted)\n", spec,
+        std::printf("spec: up to %d drafts per step (threshold %.2f), %.3f rows, %.3f tokens per sequence and step "
+                    "(%.3f drafts accepted)\n", spec, spec_threshold,
+                    double(engine.spec_rows()) / double(engine.spec_steps()),
                     double(total_out - std::size_t(seqs)) / double(seq_steps),
                     double(engine.spec_accepted()) / double(engine.spec_steps()));
       std::printf("AGGREGATE %.1f tok/s (%zu output tokens / %.2fs from the first prefill to the last token)\n",

@@ -70,13 +70,20 @@ class BatchDecoder {
   BatchDecoder(const BatchDecoder&) = delete;
   BatchDecoder& operator=(const BatchDecoder&) = delete;
 
-  // The step for n <= max_seqs sequences of M <= max_m rows (distinct slots; positions + M <= ctx; tokens
-  // [n * M], slots [n], pos [n] and temperature [n] are host arrays). Temperature <= 0: greedy. Returns the n * M
-  // sampled tokens (row r's token follows row r; host memory owned by the decoder, valid until the next step);
+  // The step for n <= max_seqs sequences, sequence b with m[b] rows (1..max_m) at positions pos[b] .. pos[b] + m[b]
+  // - 1 of slot slots[b] (distinct slots; positions below ctx); tokens [sum m] hold the sequences' rows back to back.
+  // m, tokens, slots, pos and temperature [n] are host arrays; temperature <= 0: greedy. Returns the sampled tokens,
+  // one per row (row r's token follows row r; host memory owned by the decoder, valid until the next step);
   // synchronises the stream.
+  std::span<const std::int32_t> step(int n, const std::int32_t* m, const std::int32_t* tokens,
+                                     const std::int32_t* slots, const std::int64_t* pos, const float* temperature,
+                                     std::uint64_t seed);
+  // every sequence with M rows
   std::span<const std::int32_t> step(int n, int M, const std::int32_t* tokens, const std::int32_t* slots,
-                                     const std::int64_t* pos, const float* temperature, std::uint64_t seed);
-  // every sequence at the same temperature
+                                     const std::int64_t* pos, const float* temperature, std::uint64_t seed) {
+    return step(n, std::vector<std::int32_t>(std::size_t(n), M).data(), tokens, slots, pos, temperature, seed);
+  }
+  // every sequence with M rows at the same temperature
   std::span<const std::int32_t> step(int n, int M, const std::int32_t* tokens, const std::int32_t* slots,
                                      const std::int64_t* pos, float temperature, std::uint64_t seed) {
     return step(n, M, tokens, slots, pos, std::vector<float>(std::size_t(n), temperature).data(), seed);
@@ -85,11 +92,11 @@ class BatchDecoder {
                                      const std::int64_t* pos, float temperature, std::uint64_t seed) {
     return step(n, 1, tokens, slots, pos, temperature, seed);
   }
-  // After a step of M > 1 rows: sequence b keeps its first commit[b] rows (1..M; host array of the step's n): its
-  // slot's conv states become those after them. Stream-ordered.
+  // After a step: sequence b keeps its first commit[b] rows (1..m[b]; host array of the step's n): its slot's conv
+  // states become those after them. Stream-ordered.
   void rollback(const std::int32_t* commit);
-  // The last step's DSpark taps (max_m > 1, M > 1): device bf16 [n * M, 4, H] (model.TAP_VISITS partial blocks,
-  // then the final normed hidden), the Prefiller's layout.
+  // The last step's DSpark taps (max_m > 1, a step with more than one row for some sequence): device bf16 [rows, 4,
+  // H] (model.TAP_VISITS partial blocks, then the final normed hidden), the Prefiller's layout.
   const __nv_bfloat16* taps() const { return taps_; }
 
   int max_seqs() const { return max_seqs_; }
@@ -109,18 +116,21 @@ class BatchDecoder {
   const Ablation& abl_;
   BatchState& st_;
   int max_seqs_, max_m_;
-  int last_n_ = 0, last_m_ = 0;  // the last step's shape (rollback)
+  int last_n_ = 0;            // the last step's sequences (rollback)
+  bool last_verify_ = false;  // ... and whether it kept the conv history (some sequence had more than one row)
   cudaStream_t stream_;
   std::unique_ptr<kernels::batch::TunedGemm> gemm_;
   std::vector<DeviceBuffer> storage_;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
   DeviceBuffer attn_ws_;
   std::vector<std::int32_t> sampled_host_;
-  std::vector<float> temps_host_;  // per row
+  std::vector<float> temps_host_;            // per row
+  std::vector<std::int32_t> rows_host_, last_m_;  // the last step's row offsets [n + 1] and rows per sequence
 
   // inputs and activations (rows = max_seqs * max_m), see batch.cpp
   std::int32_t *tokens_, *slots_, *sampled_;
-  float* temps_;  // per row
+  std::int32_t* rows_;  // row offsets, device [max_seqs + 1]
+  float* temps_;        // per row
   std::int64_t *pos_, *ids_;
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
   __nv_bfloat16 *xin_, *xm_, *xf_;

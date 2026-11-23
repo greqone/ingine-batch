@@ -127,7 +127,7 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   auto bf16 = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
   auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
   auto i64 = [&](std::size_t n) { return static_cast<std::int64_t*>(alloc(n * 8)); };
-  tokens_ = i32(N), slots_ = i32(S), sampled_ = i32(N);
+  tokens_ = i32(N), slots_ = i32(S), sampled_ = i32(N), rows_ = i32(S + 1);
   temps_ = f32(N);
   pos_ = i64(S), ids_ = i64(N);
   B0_ = f32(N * H), B1_ = f32(N * H);
@@ -206,26 +206,33 @@ kb::ConvStates BatchDecoder::conv_states() const {
 }
 
 void BatchDecoder::rollback(const std::int32_t* commit) {
-  if (last_m_ <= 1) return;  // a plain step keeps every row
+  if (!last_verify_) return;  // every sequence had one row: nothing to undo
   for (int b = 0; b < last_n_; ++b)
-    if (commit[b] < 1 || commit[b] > last_m_) throw std::invalid_argument("BatchDecoder::rollback: commit outside 1..M");
+    if (commit[b] < 1 || commit[b] > last_m_[std::size_t(b)])
+      throw std::invalid_argument("BatchDecoder::rollback: commit outside 1..m");
   CUDA_CHECK(cudaMemcpyAsync(commit_, commit, std::size_t(last_n_) * 4, cudaMemcpyHostToDevice, stream_));
-  kb::conv_rollback(conv_states(), last_n_, slots_, conv_backup_, {hist_k_, hist_v_, hist_attn_, hist_mlp_}, last_m_,
-                    commit_, stream_);
+  kb::conv_rollback(conv_states(), last_n_, slots_, conv_backup_, {hist_k_, hist_v_, hist_attn_, hist_mlp_},
+                    rows_host_[std::size_t(last_n_)], rows_, commit_, stream_);
 }
 
-std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_t* tokens, const std::int32_t* slots,
-                                                 const std::int64_t* pos, const float* temperature, std::uint64_t seed) {
+std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, const std::int32_t* tokens,
+                                                 const std::int32_t* slots, const std::int64_t* pos,
+                                                 const float* temperature, std::uint64_t seed) {
   if (n < 1 || n > max_seqs_) throw std::invalid_argument("BatchDecoder::step: n outside 1..max_seqs");
-  if (M < 1 || M > max_m_) throw std::invalid_argument("BatchDecoder::step: M outside 1..max_m");
+  rows_host_.resize(std::size_t(n) + 1), last_m_.assign(m, m + n);
+  rows_host_[0] = 0;
+  int M = 0;  // the most rows of a sequence
   for (int b = 0; b < n; ++b) {
+    if (m[b] < 1 || m[b] > max_m_) throw std::invalid_argument("BatchDecoder::step: rows outside 1..max_m");
     if (slots[b] < 0 || slots[b] >= st_.slots) throw std::invalid_argument("BatchDecoder::step: slot out of range");
-    if (pos[b] < 0 || pos[b] + M > st_.ctx)
+    if (pos[b] < 0 || pos[b] + m[b] > st_.ctx)
       throw std::invalid_argument("BatchDecoder::step: positions outside the slot context");
+    rows_host_[std::size_t(b) + 1] = rows_host_[std::size_t(b)] + m[b];
+    M = std::max(M, m[b]);
   }
   const Weights& w = w_;
   const cudaStream_t s = stream_;
-  const int T = n * M;  // rows: M per sequence
+  const int T = rows_host_[std::size_t(n)];  // rows: m[b] per sequence
   const bool verify = M > 1;  // keep taps, conv inputs and the overwritten conv rows (max_m > 1)
   const std::size_t slab = std::size_t(T) * H;
   const float* attn_dirs = f32p(abl_.attn_dirs);
@@ -237,9 +244,12 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
   CUDA_CHECK(cudaMemcpyAsync(tokens_, tokens, std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(slots_, slots, std::size_t(n) * 4, cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(pos_, pos, std::size_t(n) * 8, cudaMemcpyHostToDevice, s));
-  for (int r = 0; r < T; ++r) temps_host_[std::size_t(r)] = temperature[r / M];
+  CUDA_CHECK(cudaMemcpyAsync(rows_, rows_host_.data(), (std::size_t(n) + 1) * 4, cudaMemcpyHostToDevice, s));
+  for (int b = 0; b < n; ++b)
+    std::fill(temps_host_.begin() + rows_host_[std::size_t(b)], temps_host_.begin() + rows_host_[std::size_t(b) + 1],
+              temperature[b]);
   CUDA_CHECK(cudaMemcpyAsync(temps_, temps_host_.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
-  last_n_ = n, last_m_ = M;
+  last_n_ = n, last_verify_ = verify;
   if (verify) kb::conv_save(conv_states(), n, slots_, conv_backup_, s);
 
   auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
@@ -371,6 +381,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
     a.workspace_size = attn_ws_.bytes;
     a.out = attn_out_;
     a.batch = n;
+    a.rows = rows_;
     a.slots = slots_;
     a.conv_stride = st_.conv_kv_stride();
     if (layer.full) {
@@ -405,7 +416,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
     __nv_bfloat16* const wo_dst = verify ? hist_attn_ + std::size_t(v) * slab : wo_out_;
     gemm_->run(attn_out_, HEADS * HEAD_DIM, bf16_rows(layer.wo), HEADS * HEAD_DIM, wo_dst, H, false, T, H,
                HEADS * HEAD_DIM, s);
-    kb::conv(wo_dst, H, n, M, H, f32p(layer.attn_conv), s0.conv_attn_at(v), st_.conv_h_stride(), slots_, y_, s);
+    kb::conv(wo_dst, H, n, rows_, H, f32p(layer.attn_conv), s0.conv_attn_at(v), st_.conv_h_stride(), slots_, y_, s);
 
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
     std::vector<const float*> mlp_blocks = blocks;
@@ -433,7 +444,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
     kb::moe_down(me, act_, T, work, down_, s);
     __nv_bfloat16* const moe_dst = verify ? hist_mlp_ + std::size_t(v) * slab : moe_sum_;
     pk::moe_combine(down_, wts_, T, moe_dst, s);
-    kb::conv(moe_dst, H, n, M, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, y2_, s);
+    kb::conv(moe_dst, H, n, rows_, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, y2_, s);
     prev_v = v;
   }
 
