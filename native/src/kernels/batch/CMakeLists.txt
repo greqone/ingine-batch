@@ -3,6 +3,7 @@ add_library(ingine_kernels_batch STATIC
   draft_attention.cu
   draft_markov.cu
   draft_rows.cu
+  moe.cu
   mx_gemm.cpp
 )
 ingine_cuda_target(ingine_kernels_batch)
