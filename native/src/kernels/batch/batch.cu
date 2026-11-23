@@ -122,7 +122,7 @@ __device__ __forceinline__ float* state_of(const ConvStates& st, int kind, long 
                    : st.mlp + slot * st.h_stride;
 }
 
-// one thread per (sequence, conv, visit, 4 columns): reads the three old rows, then writes the new ones
+// one thread per (sequence, conv, visit, 4 columns): reads the old rows it keeps, then writes the new ones
 __global__ void conv_commit_kernel(ConvStates st, const std::int32_t* __restrict__ slots, ConvHistory hist, int T,
                                    const std::int32_t* __restrict__ rows, const std::int32_t* __restrict__ commit) {
   const int b = blockIdx.y, q = blockIdx.x * blockDim.x + threadIdx.x;
@@ -131,12 +131,11 @@ __global__ void conv_commit_kernel(ConvStates st, const std::int32_t* __restrict
   const int c = commit[b], r0 = rows[b], C = 4 * a.C4;
   float* const s = state_of(st, a.kind, slots[b]) + std::size_t(a.v) * 3 * C + 4 * a.c4;
   const __nv_bfloat16* h = a.kind == 0 ? hist.k : a.kind == 1 ? hist.v : a.kind == 2 ? hist.attn : hist.mlp;
-  float4 old[3], row[3];
-  for (int j = 0; j < 3; ++j) old[j] = *reinterpret_cast<const float4*>(s + j * C);
+  float4 row[3];
   for (int j = 0; j < 3; ++j) {  // row c + j of [old rows 0..2, the sequence's inputs]
     const int src = c + j;
     if (src < 3) {
-      row[j] = old[src];
+      row[j] = *reinterpret_cast<const float4*>(s + src * C);
     } else {
       const uint2 u =
           *reinterpret_cast<const uint2*>(h + (std::size_t(a.v) * T + std::size_t(r0) + src - 3) * C + 4 * a.c4);
