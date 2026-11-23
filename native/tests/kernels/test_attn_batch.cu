@@ -32,6 +32,7 @@ namespace {
 constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, C = HKV * D;
 constexpr int OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_KDYN = 8600;
 cudaStream_t g_stream = nullptr;
+int g_bench_call = 1;  // the benches' batched call: 1 = fp32 proj, 2 = bf16 proj16 (--proj16)
 
 __device__ std::uint64_t mix64(std::uint64_t z) {
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -85,17 +86,21 @@ struct Batch {
   std::vector<float> proj, q_scale, r_scale, rel_proj, kconv, vconv, ck0, cv0;
   std::vector<std::int64_t> kpos0;  // [nslots][rows]
   std::optional<DeviceArray<float>> dproj, dqs, drs, drp, dkc, dvc;
+  std::optional<DeviceArray<__nv_bfloat16>> dproj16;  // the same projection rows as bf16
   std::optional<DeviceArray<std::int64_t>> dpos;
   std::optional<DeviceArray<std::int32_t>> dslots, drows;
-  // per kernel (0 = cluster reference, 1 = batched)
-  std::optional<DeviceArray<std::uint8_t>> k[2], v[2], ws[2];
-  std::optional<DeviceArray<float>> ck[2], cv[2];
-  std::optional<DeviceArray<std::int64_t>> kp[2];
-  std::optional<DeviceArray<__nv_bfloat16>> out[2];
+  // per call (0 = cluster reference, 1 = batched, 2 = batched from bf16 proj16, 3 = batched with conv_write
+  // false), each on its own copy of the state
+  static constexpr int NV = 4;
+  std::optional<DeviceArray<std::uint8_t>> k[NV], v[NV], ws[NV];
+  std::optional<DeviceArray<float>> ck[NV], cv[NV];
+  std::optional<DeviceArray<std::int64_t>> kp[NV];
+  std::optional<DeviceArray<__nv_bfloat16>> out[NV];
 
   attn::DecodeArgs args(int i) const {
     attn::DecodeArgs a;
-    a.proj = dproj->get();
+    if (i == 2) a.proj16 = dproj16->get();
+    else a.proj = dproj->get();
     a.M = M;
     a.q_scale = dqs->get();
     a.r_scale = drs->get();
@@ -120,7 +125,8 @@ struct Batch {
     a.cache_stride = std::int64_t(rows) * C;
     a.kpos_stride = rows;
     a.conv_stride = 3 * C;
-    if (i == 1 && drows) a.rows = drows->get();
+    if (i >= 1 && drows) a.rows = drows->get();
+    if (i == 3) a.conv_write = false;
     return a;
   }
 
@@ -204,13 +210,14 @@ void make_batch(Batch& bt, Rng& rng, Kind kind, int M, const std::vector<std::in
     }
   }
   bt.dproj.emplace(bt.proj), bt.dqs.emplace(bt.q_scale), bt.drs.emplace(bt.r_scale), bt.drp.emplace(bt.rel_proj);
+  bt.dproj16.emplace(to_bf16(bt.proj));
   bt.dkc.emplace(bt.kconv), bt.dvc.emplace(bt.vconv);
   bt.dpos.emplace(bt.pos), bt.dslots.emplace(bt.slots);
   if (!ms.empty()) bt.drows.emplace(bt.row0);
   DeviceArray<std::uint8_t> dg(garbage);
   const std::size_t n_rows = std::size_t(bt.nslots) * bt.rows, bytes = n_rows * C * (bt.fp8 ? 1 : 2);
   const std::uint64_t seed = rng.next();
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < Batch::NV; ++i) {
     bt.k[i].emplace(bytes), bt.v[i].emplace(bytes);
     fill_kv<<<1024, 256>>>(bt.k[i]->get(), n_rows, bt.fp8, seed, dg.get());
     fill_kv<<<1024, 256>>>(bt.v[i]->get(), n_rows, bt.fp8, seed ^ 0x5555, dg.get());
@@ -253,7 +260,7 @@ bool run(Rng& rng, Kind kind, int B, int M, int phase, Worst& worst, bool ragged
   for (int b = 0; b < B; ++b) active += kind != Kind::small_ring || pos[b] + (ragged ? ms[b] : M) <= bt.rows;
   if (ragged) bt.reference_per_sequence(g_stream);
   else attn::attn_decode_cluster(bt.args(0), g_stream);
-  attn::attn_decode(bt.args(1), g_stream);
+  for (int i = 1; i < Batch::NV; ++i) attn::attn_decode(bt.args(i), g_stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
   INGINE_TEST_CUDA(cudaGetLastError());
   // output: within two BF16 ulps of the reference (accumulation order differs: rounding flips of bf16(o) and
@@ -274,13 +281,32 @@ bool run(Rng& rng, Kind kind, int B, int M, int phase, Worst& worst, bool ragged
   const std::size_t dkp = bt.full ? 0 : count_diff(*bt.kp[0], *bt.kp[1]);
   // the call advanced the conv states, unless every sequence was past its cache
   const std::size_t moved = count_diff(*bt.ck[1], DeviceArray<float>(bt.ck0));
-  const bool ok = bad == 0 && dk == 0 && dv == 0 && dck == 0 && dcv == 0 && dkp == 0 && (moved > 0) == (active > 0);
+  // bf16 projections: every output and state bit as from fp32; conv_write = false: the same outputs and caches,
+  // the conv states untouched
+  const std::size_t d16 = count_diff(*bt.out[1], *bt.out[2]) + count_diff(*bt.k[1], *bt.k[2]) +
+                          count_diff(*bt.v[1], *bt.v[2]) + count_diff(*bt.ck[1], *bt.ck[2]) +
+                          count_diff(*bt.cv[1], *bt.cv[2]) + (bt.full ? 0 : count_diff(*bt.kp[1], *bt.kp[2]));
+  const std::size_t dnw = count_diff(*bt.out[1], *bt.out[3]) + count_diff(*bt.k[1], *bt.k[3]) +
+                          count_diff(*bt.v[1], *bt.v[3]) + (bt.full ? 0 : count_diff(*bt.kp[1], *bt.kp[3])) +
+                          count_diff(*bt.ck[3], DeviceArray<float>(bt.ck0)) +
+                          count_diff(*bt.cv[3], DeviceArray<float>(bt.cv0));
+  const bool ok = bad == 0 && dk == 0 && dv == 0 && dck == 0 && dcv == 0 && dkp == 0 &&
+                  (moved > 0) == (active > 0) && d16 == 0 && dnw == 0;
   std::printf("%s %s B=%d M=%d%s phase=%d splits=%d: out max_abs=%.3e max_rel=%.3e (got %.6g ref %.6g) differ=%zu/%zu "
-              "(out of tolerance: %zu); cache k/v bytes differ %zu/%zu, conv k/v %zu/%zu, kpos %zu\n",
+              "(out of tolerance: %zu); cache k/v bytes differ %zu/%zu, conv k/v %zu/%zu, kpos %zu; proj16 vs fp32 "
+              "%zu differ, conv_write=false %zu differ\n",
               ok ? "PASS" : "FAIL", kind_name(kind), B, M, ragged ? " ragged" : "", phase,
               attn::batched_splits(B, bt.rows), max_abs, max_rel, double(got[wi]), double(ref[wi]), off, ref.size(), bad,
-              dk, dv, dck, dcv, dkp);
+              dk, dv, dck, dcv, dkp, d16, dnw);
   return ok;
+}
+
+// the projection rows the benched call reads into the L2 (the kernel before attention writes them in a step)
+void touch_proj(const Batch& bt, DeviceArray<float>& dummy) {
+  if (g_bench_call == 2)
+    read_all<<<680, 256, 0, g_stream>>>(reinterpret_cast<const float*>(bt.dproj16->get()), bt.dproj16->count / 2,
+                                        dummy.get());
+  else read_all<<<680, 256, 0, g_stream>>>(bt.dproj->get(), bt.dproj->count, dummy.get());
 }
 
 int bench(int only_m, int only_ctx) {  // 0 = all
@@ -291,7 +317,8 @@ int bench(int only_m, int only_ctx) {  // 0 = all
   INGINE_TEST_CUDA(cudaEventCreate(&e0));
   INGINE_TEST_CUDA(cudaEventCreate(&e1));
   Rng rng(7);
-  std::printf("kernel time per call, batch 64 (us); floor = KV bytes at %.2f TB/s\n", bw / 1e12);
+  std::printf("kernel time per call, batch 64 (us), %s proj; floor = KV bytes at %.2f TB/s\n",
+              g_bench_call == 2 ? "bf16" : "fp32", bw / 1e12);
   for (Kind kind : {Kind::ring, Kind::full_bf16})
     for (int M : {1, 4, 8})
       for (int ctx : {64, 300, 640, 2048}) {
@@ -305,10 +332,10 @@ int bench(int only_m, int only_ctx) {  // 0 = all
         for (int rep = 0; rep < REPS + 2; ++rep)
           for (int i = 0; i < 2; ++i) {
             read_all<<<680, 256, 0, g_stream>>>(flush.get(), flush.count, dummy.get());
-            read_all<<<680, 256, 0, g_stream>>>(bt.dproj->get(), bt.dproj->count, dummy.get());
+            touch_proj(bt, dummy);
             INGINE_TEST_CUDA(cudaEventRecord(e0, g_stream));
             if (i == 0) attn::attn_decode_cluster(bt.args(0), g_stream);
-            else attn::attn_decode(bt.args(1), g_stream);
+            else attn::attn_decode(bt.args(g_bench_call), g_stream);
             INGINE_TEST_CUDA(cudaEventRecord(e1, g_stream));
             INGINE_TEST_CUDA(cudaEventSynchronize(e1));
             float ms = 0;
@@ -332,7 +359,7 @@ int bench_ragged() {
   INGINE_TEST_CUDA(cudaEventCreate(&e0));
   INGINE_TEST_CUDA(cudaEventCreate(&e1));
   Rng rng(11);
-  std::printf("batched kernel time per call, batch 64 (us)\n");
+  std::printf("batched kernel time per call, batch 64 (us), %s proj\n", g_bench_call == 2 ? "bf16" : "fp32");
   for (Kind kind : {Kind::ring, Kind::full_bf16})
     for (int ctx : {300, 640}) {
       const Kind k = kind == Kind::ring ? Kind::small_ring : kind;
@@ -348,9 +375,9 @@ int bench_ragged() {
         constexpr int REPS = 20;
         for (int rep = 0; rep < REPS + 2; ++rep) {
           read_all<<<680, 256, 0, g_stream>>>(flush.get(), flush.count, dummy.get());
-          read_all<<<680, 256, 0, g_stream>>>(bt.dproj->get(), bt.dproj->count, dummy.get());
+          touch_proj(bt, dummy);
           INGINE_TEST_CUDA(cudaEventRecord(e0, g_stream));
-          attn::attn_decode(bt.args(1), g_stream);
+          attn::attn_decode(bt.args(g_bench_call), g_stream);
           INGINE_TEST_CUDA(cudaEventRecord(e1, g_stream));
           INGINE_TEST_CUDA(cudaEventSynchronize(e1));
           float ms_ = 0;
@@ -372,6 +399,8 @@ int bench_ragged() {
 int main(int argc, char** argv) {
   if (skip_without_gpu()) return kSkip;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]) == "--proj16") g_bench_call = 2;
   if (argc > 1 && std::string(argv[1]) == "--bench")  // --bench [M [ctx]]
     return bench(argc > 2 ? std::atoi(argv[2]) : 0, argc > 3 ? std::atoi(argv[3]) : 0);
   if (argc > 1 && std::string(argv[1]) == "--bench-ragged") return bench_ragged();

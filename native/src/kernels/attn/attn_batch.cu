@@ -92,7 +92,8 @@ struct Lay {
 };
 
 struct Params {
-    const float* proj;
+    const float* proj;            // fp32 rows, or (null)
+    const __nv_bfloat16* proj16;  // bf16 rows
     int R;
     long long cap;  // cache rows: full layers; sliding rings below 1024 rows (positions never wrap)
     int log_scaling;
@@ -115,6 +116,7 @@ struct Params {
     const int* rows;  // ragged rows [batch + 1] (null: M per sequence)
     long long cache_stride, kpos_stride, conv_stride;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
+    int conv_write;  // write the advanced conv states
 };
 
 // 16-bit offset of (key, K | V, 16-byte chunk) in a [KT][2][D] tile; chunks XOR-swizzled by key
@@ -182,7 +184,22 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
     int row0 = z * M, mb = M;
     if constexpr (RAG) row0 = p.rows[z], mb = p.rows[z + 1] - row0;
     const int p0 = int(ld_s64(p.pos + z)), rb = GQA * mb;
-    const float* const proj_z = p.proj + size_t(row0) * R;
+    // projection values (BF16-valued) at element offset `off` of the sequence's rows: fp32 proj or bf16 proj16
+    const bool p16 = p.proj16 != nullptr;
+    const float* const proj_z = p16 ? nullptr : p.proj + size_t(row0) * R;
+    const unsigned short* const proj16_z = p16 ? reinterpret_cast<const unsigned short*>(p.proj16) + size_t(row0) * R : nullptr;
+    auto bf = [](unsigned bits) { return __uint_as_float(bits << 16); };
+    auto pj1 = [&](size_t off) { return p16 ? bf(__ldcg(proj16_z + off)) : __ldcg(proj_z + off); };
+    auto pj2 = [&](size_t off) {  // off even
+        if (!p16) return __ldcg(reinterpret_cast<const float2*>(proj_z + off));
+        const unsigned u = __ldcg(reinterpret_cast<const unsigned*>(proj16_z + off));
+        return make_float2(bf(u & 0xffffu), bf(u >> 16));
+    };
+    auto pj4 = [&](size_t off) {  // off a multiple of 4
+        if (!p16) return __ldcg(reinterpret_cast<const float4*>(proj_z + off));
+        const uint2 u = __ldcg(reinterpret_cast<const uint2*>(proj16_z + off));
+        return make_float4(bf(u.x & 0xffffu), bf(u.x >> 16), bf(u.y & 0xffffu), bf(u.y >> 16));
+    };
     __nv_bfloat16* const out_z = p.out + size_t(row0) * HQ * D;
     // the projection rows and conv state next, all in flight together and ahead of the K/V tiles
     float4 qa[NQ], x4[3 + M];  // x4: [conv state 0..2, x_0 .. x_{mb-1}, zeros]
@@ -192,22 +209,20 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
 #pragma unroll
         for (int k = 0; k < NQ; ++k) {  // rows past the sequence's (ragged) are skipped, warp-uniformly
             const int row = min(w2 + 2 * k, rb - 1);
-            if (w2 + 2 * k < rb)
-                qa[k] = __ldcg(reinterpret_cast<const float4*>(proj_z + size_t(row / GQA) * R + (g * GQA + row % GQA) * D) + lane);
+            if (w2 + 2 * k < rb) qa[k] = pj4(size_t(row / GQA) * R + (g * GQA + row % GQA) * D + 4 * lane);
         }
 #pragma unroll
         for (int k = 0; k < NR; ++k) {
             const int row = min(w2 * 2 + half + 4 * k, rb - 1);
-            if (w2 * 2 + 4 * k < rb) ra[k] = __ldcg(proj_z + size_t(row / GQA) * R + OFF_REL + (g * GQA + row % GQA) * DREL + c);
+            if (w2 * 2 + 4 * k < rb) ra[k] = pj1(size_t(row / GQA) * R + OFF_REL + (g * GQA + row % GQA) * DREL + c);
         }
     } else if (s == 0) {
 #pragma unroll
         for (int j = 0; j < 3; ++j) x4[j] = __ldcg(reinterpret_cast<const float4*>(cst + j * CONV_C));
 #pragma unroll
         for (int m = 0; m < M; ++m)
-            x4[3 + m] = m < mb ? __ldcg(reinterpret_cast<const float4*>(proj_z + size_t(m) * R + (kv ? OFF_V : OFF_K) + ch0))
-                               : make_float4(0.f, 0.f, 0.f, 0.f);
-        if (FULL && lane < 4 * mb) dynv = __ldcg(proj_z + size_t(lane / 4) * R + (kv ? OFF_VDYN : OFF_KDYN) + g * 4 + lane % 4);
+            x4[3 + m] = m < mb ? pj4(size_t(m) * R + (kv ? OFF_V : OFF_K) + ch0) : make_float4(0.f, 0.f, 0.f, 0.f);
+        if (FULL && lane < 4 * mb) dynv = pj1(size_t(lane / 4) * R + (kv ? OFF_VDYN : OFF_KDYN) + g * 4 + lane % 4);
     }
     // out of cache capacity (uniform: no block reaches a barrier); a ring below 1024 rows must not wrap
     if ((FULL || p.cap < WIN) && p0 + mb > p.cap) return;
@@ -317,13 +332,15 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
                 y[m][e] = bf16r(o);
             }
         }
-        // the advanced conv state, x4[mb .. mb + 2] (only this block reads these channels); one constant-index
-        // branch per row count keeps x4 in registers
+        // the advanced conv state, x4[mb .. mb + 2] (only this block reads these channels), unless the caller
+        // writes it after acceptance; one constant-index branch per row count keeps x4 in registers
+        if (p.conv_write) {
 #pragma unroll
-        for (int n = 1; n <= M; ++n) {
-            if (n == mb) {
+            for (int n = 1; n <= M; ++n) {
+                if (n == mb) {
 #pragma unroll
-                for (int j = 0; j < 3; ++j) __stcg(reinterpret_cast<float4*>(cst + j * CONV_C), x4[n + j]);
+                    for (int j = 0; j < 3; ++j) __stcg(reinterpret_cast<float4*>(cst + j * CONV_C), x4[n + j]);
+                }
             }
         }
         // key clip / value RMS norm per token, the cache values, the new-key tile and the cache rows
@@ -546,9 +563,9 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
 
     // ---- output: bf16(bf16(o / (sum + e^sink)) * sigmoid(gate)) for rows 3 t + h, head 3 g + h, from the merged
     // (max, sum, o) of the row (log2 domain); the gates and sinks are fetched first, all in flight together
-    auto sink_at = [&](const int row) { return proj_z + size_t(row / GQA) * R + OFF_SINK + g * GQA + row % GQA; };
-    auto gate_at = [&](const int row, const int dim) {
-        return reinterpret_cast<const float2*>(proj_z + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + dim);
+    auto sink_of = [&](const int row) { return pj1(size_t(row / GQA) * R + OFF_SINK + g * GQA + row % GQA); };
+    auto gate_of = [&](const int row, const int dim) {
+        return pj2(size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + dim);
     };
     auto out_pair = [&](const int row, const int dim, const float2 ov, const float m_, const float l_, const float sinkv,
                         const float2 gv) {
@@ -567,9 +584,9 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int row = min(mt * 16 + gid + 8 * h, rb - 1);
-                sk[mt][h] = __ldcg(sink_at(row));
+                sk[mt][h] = sink_of(row);
 #pragma unroll
-                for (int n = 0; n < 4; ++n) gv[mt][h][n] = __ldcg(gate_at(row, warp * 32 + n * 8 + 2 * t4));
+                for (int n = 0; n < 4; ++n) gv[mt][h][n] = gate_of(row, warp * 32 + n * 8 + 2 * t4);
             }
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt)
@@ -638,8 +655,8 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
 #pragma unroll
         for (int it = 0; it < IT; ++it) {
             const int i = min(tid + it * NT, ni - 1), row = i / (D / 2), dim = 2 * (i % (D / 2));
-            sk[it] = __ldcg(sink_at(row));
-            gv[it] = __ldcg(gate_at(row, dim));
+            sk[it] = sink_of(row);
+            gv[it] = gate_of(row, dim);
             a[it] = make_float2(0.f, 0.f);
         }
         for (int q = 0; q < nact; ++q) {
@@ -763,6 +780,8 @@ void attn_decode_batched(const DecodeArgs& a, cudaStream_t stream) {
 
     Params p{};
     p.proj = a.proj;
+    p.proj16 = a.proj16;
+    p.conv_write = a.conv_write;
     p.R = full ? R_FULL : R_SLIDING;
     p.cap = a.cache_rows;
     p.log_scaling = a.log_scaling;
