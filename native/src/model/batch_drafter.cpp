@@ -345,8 +345,10 @@ void BatchDrafter::commit(int n, const std::int32_t* slots, const std::int64_t* 
 }
 
 BatchDrafter::Drafts BatchDrafter::draft(int n, const std::int32_t* slots, const std::int32_t* anchors,
-                                         const std::int64_t* P, float temperature, std::uint64_t seed) {
+                                         const std::int64_t* P, float temperature, std::uint64_t seed, int gamma) {
   if (n < 1 || n > max_seqs_) throw std::invalid_argument("BatchDrafter::draft: n out of range");
+  if (gamma < 1 || gamma > GAMMA) throw std::invalid_argument("BatchDrafter::draft: gamma must be in 1..7");
+  const int R = 1 + gamma;  // block rows per sequence
   const int V = w_.unembed.rows();
   host_params_.assign(3 * std::size_t(max_seqs_), 0);
   std::array<int, 3> max_keys{};
@@ -357,34 +359,35 @@ BatchDrafter::Drafts BatchDrafter::draft(int n, const std::int32_t* slots, const
     host_params_[max_seqs_ + i] = anchors[i];
     host_params_[2 * max_seqs_ + i] = std::int32_t(P[i]);
     for (int l = 0; l < 3; ++l)
-      max_keys[l] = std::max(max_keys[l], int(std::min<std::int64_t>(P[i], layers_[l].ring.rows)) + BLOCK);
+      max_keys[l] = std::max(max_keys[l], int(std::min<std::int64_t>(P[i], layers_[l].ring.rows)) + R);
   }
   CUDA_CHECK(cudaMemcpyAsync(d_params_, host_params_.data(), host_params_.size() * 4, cudaMemcpyHostToDevice, stream_));
   const kbd::DraftSeqs S{d_params_, d_params_ + max_seqs_, d_params_ + 2 * max_seqs_};
-  const int M = n * BLOCK, MH = n * GAMMA, I = inter_;
+  const int M = n * R, MH = n * gamma, I = inter_;
 
-  kbd::embed_block(n, S, static_cast<const __nv_bfloat16*>(w_.embed.data), static_cast<const float*>(w_.embed_norm.data),
-                   mask_embed_, layers_[0].in_norm, f_rnn_, res_, xn_.x, xn_.mx, f_in_, stream_);
+  kbd::embed_block(n, R, S, static_cast<const __nv_bfloat16*>(w_.embed.data),
+                   static_cast<const float*>(w_.embed_norm.data), mask_embed_, layers_[0].in_norm, f_rnn_, res_, xn_.x,
+                   xn_.mx, f_in_, stream_);
   for (int l = 0; l < 3; ++l) {
     const Layer& L = layers_[l];
     linear(xn_, L.qkv, qkv_, kd::QKV_ROWS, M, kd::QKV_ROWS, H);
-    kbd::qkv_rope(qkv_, n, S, L.q_norm, L.k_norm, q_, kb_, vb_, L.ring.fp8, stream_);
-    kbd::block_attention(q_, n, S, L.ring, kb_, vb_, max_keys[l], attn_ws_, attn_o_.x, attn_o_.mx, stream_);
+    kbd::qkv_rope(qkv_, n, R, S, L.q_norm, L.k_norm, q_, kb_, vb_, L.ring.fp8, stream_);
+    kbd::block_attention(q_, n, R, S, L.ring, kb_, vb_, max_keys[l], attn_ws_, attn_o_.x, attn_o_.mx, stream_);
     linear(attn_o_, L.wo, delta_, H, M, H, kd::Q_DIM);
-    kbd::add_rmsnorm(res_, delta_, L.post_norm, xn_.x, xn_.mx, M, nullptr, {}, stream_);
+    kbd::add_rmsnorm(res_, delta_, L.post_norm, xn_.x, xn_.mx, M, R, nullptr, {}, stream_);
     linear(xn_, L.gate_up, gu_, 2 * I, M, 2 * I, H);
     kbd::silu_mul(gu_, M, I, act_.x, act_.mx, stream_);
     linear(act_, L.down, delta_, H, M, H, I);
-    if (l < 2) kbd::add_rmsnorm(res_, delta_, layers_[l + 1].in_norm, xn_.x, xn_.mx, M, nullptr, {}, stream_);
-    else kbd::add_rmsnorm(res_, delta_, final_norm_, nullptr, {}, M, h_, head_in_.mx, stream_);
+    if (l < 2) kbd::add_rmsnorm(res_, delta_, layers_[l + 1].in_norm, xn_.x, xn_.mx, M, R, nullptr, {}, stream_);
+    else kbd::add_rmsnorm(res_, delta_, final_norm_, nullptr, {}, M, R, h_, head_in_.mx, stream_);
   }
-  // Markov head over the rows' shortlist logits: candidates, the projection's h and f_rnn parts, 7 steps
+  // Markov head over the rows' shortlist logits: candidates, the projection's h and f_rnn parts, gamma steps
   linear(head_in_, short_head_, base_, short_ld_, MH, short_ld_, H);
   kbd::topk_candidates(base_, MH, short_rows_, short_ld_, cand_val_, cand_idx_, stream_);
   gemm(h_, H, rnn_w_ + 2 * kd::RANK, kd::RNN_IN, part_h_, kd::RNN_OUT, true, MH, kd::RNN_OUT, H);
   gemm(f_in_, H, rnn_w_ + 2 * kd::RANK + H, kd::RNN_IN, part_f_, kd::RNN_OUT, true, n, kd::RNN_OUT, H);
-  kbd::markov_draft(n, S, rnn_w_, rnn_b_, w1_, part_h_, part_f_, cand_val_, cand_idx_, short_map_, fold_w_, fold_b_,
-                    temperature, seed, tokens_, conf_, stream_);
+  kbd::markov_draft(n, gamma, S, rnn_w_, rnn_b_, w1_, part_h_, part_f_, cand_val_, cand_idx_, short_map_, fold_w_,
+                    fold_b_, temperature, seed, tokens_, conf_, stream_);
   return {tokens_, conf_};
 }
 

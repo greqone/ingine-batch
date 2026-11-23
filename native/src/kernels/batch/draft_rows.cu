@@ -153,12 +153,12 @@ __device__ __forceinline__ void put_row(const uint4& y, __nv_bfloat16* x, const 
   }
 }
 
-// grid (8 rows, n), block 288
+// grid (R rows, n), block 288
 __global__ void __launch_bounds__(ROW_THREADS) embed_block_kernel(DraftSeqs S, EmbedArgs A, __nv_bfloat16* res,
                                                                   __nv_bfloat16* xn, Mx xn_mx, __nv_bfloat16* f_in) {
   __shared__ float scratch[33];
   const int r = blockIdx.x, b = blockIdx.y, c = 8 * threadIdx.x;
-  const size_t at = (size_t(b) * BLOCK + r) * H + c;
+  const size_t row = size_t(b) * gridDim.x + r, at = row * H + c;
   float x[8];
   if (r == 0) {
     float v[8];
@@ -176,10 +176,10 @@ __global__ void __launch_bounds__(ROW_THREADS) embed_block_kernel(DraftSeqs S, E
     unpack8(*reinterpret_cast<const uint4*>(A.mask_embed + c), x);
   }
   *reinterpret_cast<uint4*>(res + at) = pack8(x);
-  put_row(rms_norm(x, *reinterpret_cast<const uint4*>(A.in_norm + c), scratch), xn, xn_mx, size_t(b) * BLOCK + r);
+  put_row(rms_norm(x, *reinterpret_cast<const uint4*>(A.in_norm + c), scratch), xn, xn_mx, row);
 }
 
-// grid (8 rows, 24 q + 8 k + 8 v heads, n), block 128
+// grid (R rows, 24 q + 8 k + 8 v heads, n), block 128
 __global__ void __launch_bounds__(HEAD_DIM) qkv_rope_kernel(const __nv_bfloat16* qkv, DraftSeqs S,
                                                            const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
                                                            __nv_bfloat16* q_out, void* kb, void* vb, bool fp8) {
@@ -187,7 +187,7 @@ __global__ void __launch_bounds__(HEAD_DIM) qkv_rope_kernel(const __nv_bfloat16*
   __shared__ float pair[HEAD_DIM];
   const int r = blockIdx.x, h = blockIdx.y, b = blockIdx.z, d = threadIdx.x;
   const int pos = S.P[b] + r;
-  const size_t row = size_t(b) * BLOCK + r;
+  const size_t row = size_t(b) * gridDim.x + r;
   const __nv_bfloat16* x = qkv + row * QKV_ROWS;
   if (h < HEADS) {
     const float q = norm_rope_head(bf(x[h * HEAD_DIM + d]), q_norm, pos, scratch, pair);
@@ -204,7 +204,7 @@ __global__ void __launch_bounds__(HEAD_DIM) qkv_rope_kernel(const __nv_bfloat16*
 
 __global__ void __launch_bounds__(ROW_THREADS) add_rmsnorm_kernel(__nv_bfloat16* res, const __nv_bfloat16* delta,
                                                                   const __nv_bfloat16* w, __nv_bfloat16* xn, Mx xn_mx,
-                                                                  __nv_bfloat16* h_out, Mx h_mx) {
+                                                                  int R, __nv_bfloat16* h_out, Mx h_mx) {
   __shared__ float scratch[33];
   const int r = blockIdx.x;
   const size_t at = size_t(r) * H + 8 * threadIdx.x;
@@ -216,8 +216,8 @@ __global__ void __launch_bounds__(ROW_THREADS) add_rmsnorm_kernel(__nv_bfloat16*
   *reinterpret_cast<uint4*>(res + at) = pack8(x);
   const uint4 y = rms_norm(x, *reinterpret_cast<const uint4*>(w + 8 * threadIdx.x), scratch);
   put_row(y, xn, xn_mx, r);
-  const int i = r % BLOCK;
-  if (i != 0) put_row(y, h_out, h_mx, size_t(r / BLOCK) * GAMMA + i - 1);
+  const int i = r % R;
+  if (i != 0) put_row(y, h_out, h_mx, size_t(r / R) * (R - 1) + i - 1);
 }
 
 // a thread per 8 outputs (inter % 32 == 0: the 4 lanes of an Mx block share a row)
@@ -272,27 +272,30 @@ void commit_store(const __nv_bfloat16* const kv[3], int rows, int row_base, cons
   check_launch();
 }
 
-void embed_block(int n, const DraftSeqs& seqs, const __nv_bfloat16* embed, const float* embed_norm,
+void embed_block(int n, int R, const DraftSeqs& seqs, const __nv_bfloat16* embed, const float* embed_norm,
                  const __nv_bfloat16* mask_embed, const __nv_bfloat16* in_norm, const __nv_bfloat16* f_rnn,
                  __nv_bfloat16* res, __nv_bfloat16* xn, Mx xn_mx, __nv_bfloat16* f_in, cudaStream_t stream) {
   if (n <= 0) return;
+  if (R < 2 || R > BLOCK) throw std::invalid_argument("bdraft::embed_block: R must be in 2..8");
   const EmbedArgs A{embed, embed_norm, mask_embed, in_norm, f_rnn};
-  embed_block_kernel<<<dim3(BLOCK, n), ROW_THREADS, 0, stream>>>(seqs, A, res, xn, xn_mx, f_in);
+  embed_block_kernel<<<dim3(R, n), ROW_THREADS, 0, stream>>>(seqs, A, res, xn, xn_mx, f_in);
   check_launch();
 }
 
-void qkv_rope(const __nv_bfloat16* qkv, int n, const DraftSeqs& seqs, const __nv_bfloat16* q_norm,
+void qkv_rope(const __nv_bfloat16* qkv, int n, int R, const DraftSeqs& seqs, const __nv_bfloat16* q_norm,
               const __nv_bfloat16* k_norm, __nv_bfloat16* q_out, void* kb, void* vb, bool fp8, cudaStream_t stream) {
   if (n <= 0) return;
-  qkv_rope_kernel<<<dim3(BLOCK, HEADS + 2 * KV_HEADS, n), HEAD_DIM, 0, stream>>>(qkv, seqs, q_norm, k_norm, q_out, kb,
-                                                                                 vb, fp8);
+  if (R < 2 || R > BLOCK) throw std::invalid_argument("bdraft::qkv_rope: R must be in 2..8");
+  qkv_rope_kernel<<<dim3(R, HEADS + 2 * KV_HEADS, n), HEAD_DIM, 0, stream>>>(qkv, seqs, q_norm, k_norm, q_out, kb, vb,
+                                                                             fp8);
   check_launch();
 }
 
 void add_rmsnorm(__nv_bfloat16* res, const __nv_bfloat16* delta, const __nv_bfloat16* w, __nv_bfloat16* xn, Mx xn_mx,
-                 int rows, __nv_bfloat16* h_out, Mx h_mx, cudaStream_t stream) {
+                 int rows, int R, __nv_bfloat16* h_out, Mx h_mx, cudaStream_t stream) {
   if (rows <= 0) return;
-  add_rmsnorm_kernel<<<rows, ROW_THREADS, 0, stream>>>(res, delta, w, xn, xn_mx, h_out, h_mx);
+  if (R < 2 || R > BLOCK) throw std::invalid_argument("bdraft::add_rmsnorm: R must be in 2..8");
+  add_rmsnorm_kernel<<<rows, ROW_THREADS, 0, stream>>>(res, delta, w, xn, xn_mx, R, h_out, h_mx);
   check_launch();
 }
 
