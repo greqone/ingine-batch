@@ -24,7 +24,7 @@
     },
     {
       "name": "install",
-      "displayName": "ingine-serve for scripts/install.sh: private CUDA toolkit in ../.cuda-toolkit, RPATH into it",
+      "displayName": "ingine-serve against a private CUDA toolkit in ../.cuda-toolkit (RPATH into it)",
       "inherits": "release",
       "binaryDir": "${sourceDir}/build-install",
       "cacheVariables": {

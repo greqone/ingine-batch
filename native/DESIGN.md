@@ -19,8 +19,9 @@ math, decode kernels, CLI flags and HTTP behaviour. Hardware: RTX 5090 class onl
 | `src/serve`, `src/engine` | `server.py`: `/health`, `/v1/models`, `/v1/chat/completions` (streaming, `reasoning_content`, tools), FIFO scheduler |
 | `src/image`, `src/kernels/vision`, `src/model/vision.*` | none (the Python engine was text only): image input, written against the transformers reference (`Inkling2ImageProcessor`, `Inkling2VisionModel`); see "Images" below |
 
-The serving profile (262,144 tokens, `--dense-fp8 --kv-fp8 --spec --spec-threshold 0.8`, 127.0.0.1:8003) comes
-from `runtime-manifest.json`.
+The single-request serving profile of the upstream distribution is 262,144 tokens with `--dense-fp8 --kv-fp8 --spec
+--spec-threshold 0.8`; batched serving (`--batch`, see the repository's README.md) runs BF16 dense weights and BF16
+caches.
 
 ## Base: fngine
 

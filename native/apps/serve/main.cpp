@@ -110,7 +110,8 @@ int main(int argc, char** argv) {
   ap.option("--max-image-tokens", "", "image tokens accepted in one request", &max_image_tokens);
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
-  ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
+  ap.option("--max-queue", "", "requests allowed to wait behind the running one (with --batch: for a free slot)",
+            &max_queue);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
