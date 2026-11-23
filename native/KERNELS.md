@@ -117,6 +117,11 @@ log_scaling, workspace, out)`
   (`pos + M > rows` does nothing, as for full layers). Same results as one call per sequence: up to
   accumulation order (BF16 rounding flips of the output), caches, `kpos` and conv states bit-identical.
   Target at batch 64, M = 1: ≤ 1.3 × the K/V read time + 10 µs per visit.
+* Ragged rows (`DecodeArgs::rows`, int32 `[batch + 1]` on the device): sequence b has `m_b = rows[b+1] -
+  rows[b]` tokens (1..M) in rows `rows[b] ..` of `proj` and `out`, at positions `pos[b] ..`; everything else
+  as a uniform call with M = m_b for that sequence (causal among its rows, m_b new cache rows, conv state
+  advanced by m_b, `pos + m_b > rows` does nothing). The kernel is the one for M; work past each sequence's
+  rows is skipped, so pass M = the largest m_b.
 
 ## Area `dense` (projections, mixing, router, head)
 
