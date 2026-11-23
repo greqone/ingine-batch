@@ -90,6 +90,7 @@ int main() {
     for (int T : {9, 64, 128, 256, 512, 700}) {
       std::printf("-- %s T=%d (tile %d)\n", fmt == 0 ? "NVFP4" : "MXFP8", T, kb::moe_tile_rows(T));
       route(b, logits, bias, T, s);
+      ok &= check_select(b, T);
       ok &= compare(b, ex.ex, x, T, s);
     }
   }
