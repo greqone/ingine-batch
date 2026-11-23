@@ -268,6 +268,8 @@ int main(int argc, char** argv) {
       report["decode_s"] = decode_s;
       report["aggregate_tps"] = double(total_out) / wall;
       report["full_step_ms"] = full ? full_ms / full : 0.0;
+      report["step_n"] = step_n;  // running sequences and seconds of every step
+      report["step_s"] = step_s;
     } else {
       cudaStream_t stream;
       CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -433,7 +435,8 @@ int main(int argc, char** argv) {
       report["requests"] = reqs;
       report["seqs"] = seqs;
       report["temperature"] = temperature;
-      std::ofstream(out_file) << report.dump(1) << "\n";
+      // a response cut at --tokens may end inside a UTF-8 sequence: replace its bytes instead of failing
+      std::ofstream(out_file) << report.dump(1, ' ', false, nlohmann::json::error_handler_t::replace) << "\n";
     }
     return 0;
   } catch (const std::exception& e) {
