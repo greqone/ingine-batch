@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
   std::string prompts_file = std::string(INGINE_REPO_DIR) + "/bench/prompts-short.json";
   int seqs = 64, slots = 0, ctx = 768, tokens = 512, prefill_chunk = 512, spec = 0;
   double spec_threshold = 0.0;
+  int spec_min = 0;
   double temperature = 0.0;
   int seed = 1;
   bool reference = false, ignore_eos = false, kv_fp8 = false, accept_all = false;
@@ -80,6 +81,7 @@ int main(int argc, char** argv) {
             "with --spec: per sequence, the drafts whose estimated acceptance exceeds this x running/slots (at most K; "
             "0 = always K)",
             &spec_threshold);
+  ap.option("--spec-min", "", "with --spec-threshold: at least this many drafts per sequence", &spec_min);
   ap.option("--oracle", "", "with --spec: the drafts are the output tokens of FILE (another run's --out)", &oracle_file);
   ap.option("--spec-trace", "", "with --spec: write the drafts verified, accepted and their confidences per step to FILE",
             &spec_trace);
@@ -211,6 +213,7 @@ int main(int argc, char** argv) {
       options.kv_fp8 = kv_fp8;
       options.spec_trace = spec_trace;
       options.spec_threshold = float(spec_threshold);
+      options.spec_min = spec_min;
       m::BatchEngine engine(options);
       std::size_t free1 = 0;
       cudaMemGetInfo(&free1, &total);

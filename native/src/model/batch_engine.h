@@ -30,8 +30,9 @@ struct BatchEngineOptions {
   int prefill_chunk = 512;         // prompt tokens per Prefiller call
   int spec = 0;                    // DSpark drafts verified per step and sequence (1..7, at most); 0: plain decoding
   // > 0: per sequence, the leading drafts whose estimated acceptance (the product of the drafter's confidences)
-  // exceeds spec_threshold x (running sequences / slots); 0: always spec drafts
+  // exceeds spec_threshold x (running sequences / slots), but at least spec_min; 0: always spec drafts
   float spec_threshold = 0.f;
+  int spec_min = 0;
   bool kv_fp8 = false;             // FP8 E4M3 full-attention caches
   // speculative: a line per sequence and step, "<slot> <drafts verified> <accepted> <conf of the 7 drafts>"
   std::filesystem::path spec_trace;
@@ -77,6 +78,7 @@ class BatchEngine final : public BatchBackend {
   const bool ablated_;
   const int prefill_chunk_, spec_;
   const float spec_threshold_;
+  const int spec_min_;
   Weights w_;
   Ablation abl_;
   BatchState st_;

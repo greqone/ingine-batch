@@ -31,6 +31,7 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
       prefill_chunk_(o.prefill_chunk),
       spec_(o.spec),
       spec_threshold_(o.spec_threshold),
+      spec_min_(std::max(0, std::min(o.spec_min, o.spec))),
       w_(load_weights(o.model_dir, /*dense_fp8=*/false, stream_.s)),
       abl_(load_ablation(o.ablation)),
       st_(make_batch_state(o.slots, o.ctx, o.kv_fp8)),
@@ -190,7 +191,7 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
       const float* c = conf_.data() + std::size_t(seqs[i].slot) * G;
       float p = 1.f;
       k = 0;
-      while (k < spec_ && (p *= c[k]) > theta) ++k;
+      while (k < spec_ && ((p *= c[k]) > theta || k < spec_min_)) ++k;
     }
     m_[std::size_t(i)] = k + 1;
   }
