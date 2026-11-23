@@ -4,6 +4,8 @@ ingine_add_test(NAME batch_mx_gemm SOURCES test_mx_gemm.cpp LIBS ingine_kernels_
                 TIMEOUT 300)
 # Batched-step expert kernels against their prefill counterparts.
 ingine_add_test(NAME batch_moe SOURCES test_moe.cu LIBS ingine_kernels_batch ingine_kernels_prefill GPU TIMEOUT 600)
+# The head with the token choice fused against sample over its logits (greedy, sampled, ties).
+ingine_add_test(NAME batch_head_sample SOURCES test_head_sample.cu LIBS ingine_kernels_batch GPU TIMEOUT 300)
 
 if(TARGET ingine_model)
   # BatchDrafter against the Drafter with the real mtp.safetensors and a synthetic 4096-token target (~4 GB).

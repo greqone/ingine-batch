@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
       m::BatchState st = m::make_batch_state(slots, ctx, kv_fp8);
       m::Prefiller pf(w, abl, prefill_chunk, stream);
       m::BatchDecoder dec(w, abl, st, seqs, stream, spec + 1);
+      if (!forced_file.empty()) dec.keep_logits(true);  // the misses' margins
       ingine::DeviceBuffer chunk(std::size_t(prefill_chunk) * 4), logits(std::size_t(m::UNPADDED_VOCAB) * 4), first(4);
       CUDA_CHECK(cudaStreamSynchronize(stream));
       std::size_t free1 = 0;

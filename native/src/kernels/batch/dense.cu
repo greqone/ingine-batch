@@ -16,23 +16,59 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
          (std::uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(hi))) << 16);
 }
 
-// ---- BF16 GEMM: C[M, N] = A[M, K] . B[N, K]^T
+// ---- the head: L[M, N] = A[M, K] . B[N, K]^T (FP32), and kb::sample's choice of a token per row
 //
 // Warp tile (MF * 16) x (NF * 8), WM x WN warps. Both operands are K-contiguous rows; a stage holds TM rows of A and
 // TN rows of B, 64 elements (128 bytes = 8 chunks of 16 bytes, whole lines from DRAM) each, chunk c of row r at
 // chunk c ^ (r & 7) so the 8 rows of an ldmatrix hit distinct banks. cp.async in STAGES stages (rows past M / N
 // zero-filled), one barrier per stage, four k16 MMA steps per stage. The row tiles of A are the fastest grid
-// dimension, so the CTAs that share B's rows run together and B streams from DRAM once.
+// dimension, so the CTAs that share B's rows run together and B streams from DRAM once. Epilogue: L to C (when
+// given), and per row the tile's best (key, v) (pick_key; ties to the lowest v) to the partials.
 
 constexpr int BK = 64;
 
-struct MmaArgs {
+struct HeadArgs {
   const __nv_bfloat16* A;
   const __nv_bfloat16* B;
-  void* C;
+  float* C;  // nullptr: L not stored
   int lda, ldb, ldc, M, N, K;
-  int c_fp32;
+  const float* temps;
+  std::uint64_t seed;
+  int2* partials;  // [M, ntiles]: (key bits, v)
+  int ntiles;
 };
+
+__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+
+// kb::sample's operations (batch.cu sample_kernel, raw logits): s_v = 30 tanh(bf16(l) / 30), plus for T > 0
+// s_v / T + Gumbel noise of (seed, row, v)
+__device__ __forceinline__ std::uint64_t mix64(std::uint64_t z) {
+  z += 0x9E3779B97F4A7C15ull;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+__device__ __forceinline__ std::uint64_t row_key(std::uint64_t seed, int row) {
+  return mix64(seed ^ (std::uint64_t(row) * 0xD1B54A32D192ED03ull));
+}
+__device__ __forceinline__ float pick_key(float l, bool greedy, float inv_t, std::uint64_t rkey, int v) {
+  float key = 30.f * tanhf(bf16r(l) / 30.f);
+  if (!greedy) {
+    const float u = (float(mix64(rkey ^ std::uint64_t(v)) >> 40) + 0.5f) * (1.f / 16777216.f);
+    key = key * inv_t - __logf(-__logf(u));
+  }
+  return key;
+}
+__device__ __forceinline__ bool better(float a, int av, float b, int bv) { return a > b || (a == b && av < bv); }
+template <int LANES>
+__device__ __forceinline__ void lanes_best(float& k, int& v) {  // over lane bits below LANES
+#pragma unroll
+  for (int o = 1; o < LANES; o <<= 1) {
+    const float ok = __shfl_xor_sync(0xffffffffu, k, o);
+    const int ov = __shfl_xor_sync(0xffffffffu, v, o);
+    if (better(ok, ov, k, v)) k = ok, v = ov;
+  }
+}
 
 __device__ __forceinline__ std::uint32_t smem_addr(const void* p) {
   return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
@@ -69,7 +105,7 @@ struct MmaCfg {
 };
 
 template <class C>
-__global__ void __launch_bounds__(C::NT) mma_gemm_kernel(const MmaArgs p) {
+__global__ void __launch_bounds__(C::NT) head_kernel(const HeadArgs p) {
   extern __shared__ __align__(128) std::uint8_t smem[];
   constexpr int MF = C::MF, NF = C::NF, TM = C::TM, TN = C::TN, NT = C::NT, STAGES = C::STAGES;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -143,41 +179,95 @@ __global__ void __launch_bounds__(C::NT) mma_gemm_kernel(const MmaArgs p) {
   asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 
   // thread holds rows lane / 4 (+ 8), columns 2 (lane % 4) (+ 1) of each m16 x n8 block
+  float best_k[MF][2];
+  int best_v[MF][2];
 #pragma unroll
   for (int i = 0; i < MF; ++i)
 #pragma unroll
-    for (int j = 0; j < NF; ++j) {
-      const int col = warp_n * NF * 8 + j * 8 + (lane & 3) * 2;
-      if (col >= n_rows) continue;
+    for (int h = 0; h < 2; ++h) {
+      const int row = warp_m * MF * 16 + i * 16 + (lane >> 2) + h * 8, grow = mtile * TM + row;
+      best_k[i][h] = -INFINITY, best_v[i][h] = 0x7fffffff;
+      if (row >= m_rows) continue;
+      const float t = p.temps[grow];
+      const bool greedy = !(t > 0.f);
+      const float inv_t = greedy ? 1.f : 1.f / t;
+      const std::uint64_t rkey = row_key(p.seed, grow);
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int row = warp_m * MF * 16 + i * 16 + (lane >> 2) + h * 8;
-        if (row >= m_rows) continue;
-        const std::size_t off = std::size_t(mtile * TM + row) * p.ldc + ntile * TN + col;
-        if (p.c_fp32)
-          *reinterpret_cast<float2*>(static_cast<float*>(p.C) + off) = make_float2(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
-        else
-          *reinterpret_cast<std::uint32_t*>(static_cast<__nv_bfloat16*>(p.C) + off) =
-              pack_bf16x2(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+      for (int j = 0; j < NF; ++j) {
+        const int col = warp_n * NF * 8 + j * 8 + (lane & 3) * 2;
+        if (col >= n_rows) continue;
+        if (p.C)
+          *reinterpret_cast<float2*>(p.C + std::size_t(grow) * p.ldc + ntile * TN + col) =
+              make_float2(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {  // N even: col + 1 < n_rows
+          const int v = ntile * TN + col + e;
+          const float key = pick_key(acc[i][j][2 * h + e], greedy, inv_t, rkey, v);
+          if (better(key, v, best_k[i][h], best_v[i][h])) best_k[i][h] = key, best_v[i][h] = v;
+        }
       }
     }
+  // the tile's best per row: the row's 4 lanes, then the WN warps of its warp row (in the stages' shared memory,
+  // once every warp is past its last MMA: no static shared memory, two CTAs per SM)
+  __syncthreads();
+  auto red_k = reinterpret_cast<float(*)[C::WN]>(smem);
+  auto red_v = reinterpret_cast<int(*)[C::WN]>(smem + TM * C::WN * sizeof(float));
+#pragma unroll
+  for (int i = 0; i < MF; ++i)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      lanes_best<4>(best_k[i][h], best_v[i][h]);
+      const int row = warp_m * MF * 16 + i * 16 + (lane >> 2) + h * 8;
+      if ((lane & 3) == 0) red_k[row][warp_n] = best_k[i][h], red_v[row][warp_n] = best_v[i][h];
+    }
+  __syncthreads();
+  for (int row = tid; row < m_rows; row += NT) {
+    float k = red_k[row][0];
+    int v = red_v[row][0];
+    for (int w = 1; w < C::WN; ++w)
+      if (better(red_k[row][w], red_v[row][w], k, v)) k = red_k[row][w], v = red_v[row][w];
+    p.partials[std::size_t(mtile * TM + row) * p.ntiles + ntile] = make_int2(__float_as_int(k), v);
+  }
 }
 
-// configs (cfg order): 64 x 128 (8 warps), 64 x 64 (4 warps), 32 x 128 (8 warps); two stages, so that two CTAs share
-// an SM (one computes while the other waits)
-using Cfg0 = MmaCfg<2, 4, 2, 4, 2>;
-using Cfg1 = MmaCfg<2, 4, 2, 2, 2>;
-using Cfg2 = MmaCfg<1, 4, 2, 4, 2>;
+// one CTA per row: the best of the row's tiles
+constexpr int PICK_T = 256;
+__global__ void __launch_bounds__(PICK_T) head_pick_kernel(const int2* __restrict__ partials, int ntiles,
+                                                           std::int32_t* __restrict__ out) {
+  const int2* const p = partials + std::size_t(blockIdx.x) * ntiles;
+  float k = -INFINITY;
+  int v = 0x7fffffff;
+  for (int i = threadIdx.x; i < ntiles; i += PICK_T) {
+    const int2 x = p[i];
+    if (better(__int_as_float(x.x), x.y, k, v)) k = __int_as_float(x.x), v = x.y;
+  }
+  lanes_best<32>(k, v);
+  __shared__ float s_k[PICK_T / 32];
+  __shared__ int s_v[PICK_T / 32];
+  if ((threadIdx.x & 31) == 0) s_k[threadIdx.x >> 5] = k, s_v[threadIdx.x >> 5] = v;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    for (int w = 1; w < PICK_T / 32; ++w)
+      if (better(s_k[w], s_v[w], s_k[0], s_v[0])) s_k[0] = s_k[w], s_v[0] = s_v[w];
+    out[blockIdx.x] = s_v[0];
+  }
+}
+
+// configs: 64 x 128 (8 warps), 32 x 128 (8 warps, up to 32 rows); two stages, so that two CTAs share an SM (one
+// computes while the other waits)
+constexpr int HEAD_TN = 128;
+using Cfg64 = MmaCfg<2, 4, 2, 4, 2>;
+using Cfg32 = MmaCfg<1, 4, 2, 4, 2>;
+static_assert(Cfg64::TN == HEAD_TN && Cfg32::TN == HEAD_TN);
 
 template <class C>
-void launch(const MmaArgs& a, cudaStream_t stream) {
+void launch(const HeadArgs& a, cudaStream_t stream) {
   static const bool attr = [] {
-    return cudaFuncSetAttribute(mma_gemm_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) ==
-           cudaSuccess;
+    return cudaFuncSetAttribute(head_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) == cudaSuccess;
   }();
-  if (!attr) throw std::runtime_error("batch mma_gemm: shared memory attribute");
+  if (!attr) throw std::runtime_error("batch head_sample: shared memory attribute");
   cudaLaunchConfig_t cfg{};
-  cfg.gridDim = dim3((a.M + C::TM - 1) / C::TM, (a.N + C::TN - 1) / C::TN);
+  cfg.gridDim = dim3((a.M + C::TM - 1) / C::TM, a.ntiles);
   cfg.blockDim = dim3(C::NT);
   cfg.dynamicSmemBytes = C::SMEM;
   cfg.stream = stream;
@@ -186,8 +276,8 @@ void launch(const MmaArgs& a, cudaStream_t stream) {
   pdl.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &pdl;
   cfg.numAttrs = 1;
-  if (cudaLaunchKernelEx(&cfg, mma_gemm_kernel<C>, a) != cudaSuccess)
-    throw std::runtime_error("batch mma_gemm: launch failed");
+  if (cudaLaunchKernelEx(&cfg, head_kernel<C>, a) != cudaSuccess)
+    throw std::runtime_error("batch head_sample: launch failed");
 }
 
 // prefill gate_apply_kernel (same operations), gate blockIdx.y, f / g rows at fg + (g * T + t) * 2H (+ H); the rows
@@ -226,15 +316,17 @@ __global__ void __launch_bounds__(ROW_T)
 
 }  // namespace
 
-void mma_gemm(int cfg, const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, void* C, int ldc, bool c_fp32,
-              int M, int N, int K, cudaStream_t stream) {
-  const MmaArgs a{A, B, C, lda, ldb, ldc, M, N, K, c_fp32 ? 1 : 0};
-  switch (cfg) {
-    case 0: launch<Cfg0>(a, stream); break;
-    case 1: launch<Cfg1>(a, stream); break;
-    case 2: launch<Cfg2>(a, stream); break;
-    default: throw std::invalid_argument("batch mma_gemm: config " + std::to_string(cfg));
-  }
+std::size_t head_partials(int M, int N) { return std::size_t(M) * ((N + HEAD_TN - 1) / HEAD_TN); }
+
+void head_sample(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, int M, int N, int K,
+                 const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
+                 cudaStream_t stream) {
+  if (M <= 0 || N <= 0 || K % BK || lda % 8 || ldb % 8 || N % 2 || (logits && ldc % 2))
+    throw std::invalid_argument("batch head_sample: unsupported shape");
+  const HeadArgs a{A, B, logits, lda, ldb, ldc, M, N, K, temps, seed, partials, (N + HEAD_TN - 1) / HEAD_TN};
+  if (M <= 32) launch<Cfg32>(a, stream);
+  else launch<Cfg64>(a, stream);
+  head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, a.ntiles, out);
 }
 
 void gate_apply(const prefill::GateRows& rows, int G, const float* fg, int T, const float* norm_w, __nv_bfloat16* out,
