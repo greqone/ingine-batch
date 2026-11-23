@@ -9,7 +9,7 @@
 // sequence alone with M = its count.
 // `--bench`: kernel time per call at batch 64 (old vs new), sliding and full BF16 layers, M = 1, 4, 8,
 // contexts 64, 300, 640 and 2048, the L2 flushed before every call. `--bench-ragged`: uniform M = 3 and 5
-// against ragged rows in 1..5 at contexts 300 and 640.
+// against ragged rows in 1..5 at contexts 300 and 640. `--bench-prod [case]`: the production regime (below).
 #include "kernels/oracle.h"
 
 #include "kernels/attn/attn.h"
@@ -394,6 +394,88 @@ int bench_ragged() {
   return 0;
 }
 
+// --bench-prod [case]: the batched kernel as a decode step calls it (bf16 proj16, conv_write = false), L2 flushed
+// before every call; us per call and GB/s of the K/V rows read (4 KB per sequence and cached key). Batch 64 with
+// ragged rows (spec: 3..5 rows, mean 3.7, M = 5; wide: 1..8, mean ~3.75, M = 8) at mean contexts 128..640 (+-48
+// per sequence, as a step's sequences differ) on 640-row sliding rings and full BF16 caches, then other regimes:
+// batch 1 / 8 / 24 / 44 / 64, uniform M = 1 and 8, long contexts with key splits, a wrapped 1024-row ring.
+// `case`: only the case of that index (0-based, in print order).
+int bench_prod(int only) {
+  const double bw = 1.79e12;
+  DeviceArray<float> flush(std::size_t(48) << 20), dummy(1);
+  cudaEvent_t e0, e1;
+  INGINE_TEST_CUDA(cudaEventCreate(&e0));
+  INGINE_TEST_CUDA(cudaEventCreate(&e1));
+  Rng rng(17);
+  auto time_one = [&](const char* label, Kind kind, int M, const std::vector<std::int64_t>& pos,
+                      const std::vector<std::int32_t>& ms, int ring_rows) {
+    static int ncase = -1;
+    if (++ncase != only && only >= 0) return;
+    Batch bt;
+    make_batch(bt, rng, kind, M, pos, ring_rows, ms);
+    attn::DecodeArgs a = bt.args(2);
+    a.conv_write = false;
+    constexpr int REPS = 30;
+    double t = 0;
+    for (int rep = 0; rep < REPS + 3; ++rep) {
+      read_all<<<680, 256, 0, g_stream>>>(flush.get(), flush.count, dummy.get());
+      read_all<<<680, 256, 0, g_stream>>>(reinterpret_cast<const float*>(bt.dproj16->get()), bt.dproj16->count / 2,
+                                          dummy.get());
+      INGINE_TEST_CUDA(cudaEventRecord(e0, g_stream));
+      attn::attn_decode(a, g_stream);
+      INGINE_TEST_CUDA(cudaEventRecord(e1, g_stream));
+      INGINE_TEST_CUDA(cudaEventSynchronize(e1));
+      float ms_ = 0;
+      INGINE_TEST_CUDA(cudaEventElapsedTime(&ms_, e0, e1));
+      if (rep >= 3) t += ms_ * 1e3 / REPS;
+    }
+    double keys = 0, rows = 0, ctx = 0;
+    for (int b = 0; b < bt.B; ++b) {
+      keys += double(bt.full ? pos[b] : std::min<std::int64_t>(pos[b], WIN));
+      rows += ms.empty() ? M : ms[b];
+      ctx += double(pos[b]) / bt.B;
+    }
+    const double gbs = keys * 4096 / (t * 1e-6) / 1e9;
+    std::printf("%-26s %-7s M=%d rows/seq %.2f ctx %5.0f: %7.1f us %7.1f GB/s %5.1f%%  splits %d\n", label,
+                bt.full ? "full" : "sliding", M, rows / bt.B, ctx, t, gbs, gbs * 1e9 / bw * 100,
+                attn::batched_splits(bt.B, bt.rows));
+  };
+  // batch 64, ragged
+  std::vector<std::int32_t> spec(64), wide(64);
+  for (int b = 0; b < 64; ++b) {
+    const int u = int(rng.next() % 20);
+    spec[b] = u < 9 ? 3 : u < 17 ? 4 : 5;  // 45 / 40 / 15 %
+    wide[b] = rng.next() % 2 ? 1 + int(rng.next() % 8) : 1 + int(rng.next() % 5);
+  }
+  spec[5] = 5, wide[5] = 8;
+  for (Kind kind : {Kind::small_ring, Kind::full_bf16})
+    for (int ctx : {128, 256, 384, 512, 640}) {
+      std::vector<std::int64_t> pos(64);
+      for (int b = 0; b < 64; ++b) pos[b] = ctx - 48 + int((std::uint32_t(b + 1) * 2654435761u >> 13) % 97);
+      time_one("batch 64 ragged spec 3..5", kind, 5, pos, spec, std::max(640, ctx + 64));
+      time_one("batch 64 ragged wide 1..8", kind, 8, pos, wide, std::max(640, ctx + 64));
+    }
+  // other regimes (uniform rows)
+  struct Reg {
+    int B, M, ctx;
+    Kind kind;
+  };
+  const Reg regs[] = {
+      {64, 1, 384, Kind::small_ring}, {64, 8, 384, Kind::small_ring}, {64, 1, 640, Kind::full_bf16},
+      {64, 8, 640, Kind::full_bf16},  {64, 4, 2048, Kind::full_bf16}, {64, 4, 3000, Kind::ring},
+      {44, 4, 560, Kind::full_bf16},  {24, 4, 560, Kind::small_ring}, {8, 1, 640, Kind::small_ring},
+      {8, 8, 640, Kind::full_bf16},   {8, 4, 4096, Kind::full_bf16},  {8, 8, 4096, Kind::ring},
+      {1, 1, 640, Kind::small_ring},  {1, 8, 640, Kind::full_bf16},   {1, 1, 4096, Kind::full_bf16},
+      {1, 8, 4096, Kind::full_bf16},  {1, 8, 4096, Kind::ring},
+  };
+  for (const Reg& r : regs) {
+    char label[64];
+    std::snprintf(label, sizeof label, "batch %d uniform", r.B);
+    time_one(label, r.kind, r.M, std::vector<std::int64_t>(r.B, r.ctx), {}, std::max(640, r.ctx + 48));
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -404,6 +486,7 @@ int main(int argc, char** argv) {
   if (argc > 1 && std::string(argv[1]) == "--bench")  // --bench [M [ctx]]
     return bench(argc > 2 ? std::atoi(argv[2]) : 0, argc > 3 ? std::atoi(argv[3]) : 0);
   if (argc > 1 && std::string(argv[1]) == "--bench-ragged") return bench_ragged();
+  if (argc > 1 && std::string(argv[1]) == "--bench-prod") return bench_prod(argc > 2 ? std::atoi(argv[2]) : -1);
   Rng rng(9090);
   bool ok = true;
   Worst worst;
