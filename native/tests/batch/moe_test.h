@@ -71,17 +71,17 @@ struct Diff {
   }
 };
 
-// Work buffers for chunks of up to max_T tokens (prefill tiles and batch tiles).
+// Work buffers for chunks of up to max_T tokens (prefill selection and tiles; batch selection and tiles).
 struct Bufs {
   int max_T;
-  float* wts;
-  int* idx;
+  float *wts_o, *wts_n;
+  int *idx_o, *idx_n;
   pk::MoeWork wo, wn;  // prefill routing, batch routing
   uint16_t *act_o, *act_n, *act_p, *down_o, *down_n, *out_o, *out_n;
   explicit Bufs(int maxT) : max_T(maxT) {
     const size_t P = size_t(maxT) * TOPK;
-    wts = dalloc<float>(P);
-    idx = dalloc<int>(P);
+    wts_o = dalloc<float>(P), wts_n = dalloc<float>(P);
+    idx_o = dalloc<int>(P), idx_n = dalloc<int>(P);
     wo = {dalloc<int>(E), dalloc<int>(1), dalloc<int4>(pk::moe_tiles_capacity(maxT)), dalloc<int>(P), dalloc<int>(P)};
     wn = {dalloc<int>(E), dalloc<int>(1), dalloc<int4>(kb::moe_tiles_capacity(maxT)), dalloc<int>(P), dalloc<int>(P)};
     act_o = dalloc<uint16_t>(P * I), act_n = dalloc<uint16_t>(P * I), act_p = dalloc<uint16_t>(P * I);
@@ -93,13 +93,47 @@ struct Bufs {
 inline const __nv_bfloat16* bfp(const uint16_t* p) { return reinterpret_cast<const __nv_bfloat16*>(p); }
 inline __nv_bfloat16* bfp(uint16_t* p) { return reinterpret_cast<__nv_bfloat16*>(p); }
 
-// router selection (shared) and both routings from FP32 logits [T, 128]
+// both selections and routings from FP32 logits [T, 128]: prefill::moe_topk + moe_route, batch moe_select
 inline void route(Bufs& b, const float* logits, const float* bias, int T, cudaStream_t s) {
   INGINE_TEST_CUDA(cudaMemsetAsync(b.wo.counts, 0, E * sizeof(int), s));
-  pk::moe_topk(logits, bias, T, b.idx, b.wts, b.wo.counts, s);
-  INGINE_TEST_CUDA(cudaMemcpyAsync(b.wn.counts, b.wo.counts, E * sizeof(int), cudaMemcpyDeviceToDevice, s));
-  pk::moe_route(b.idx, T, b.wo, s);
-  kb::moe_route(b.idx, T, b.wn, s);
+  pk::moe_topk(logits, bias, T, b.idx_o, b.wts_o, b.wo.counts, s);
+  pk::moe_route(b.idx_o, T, b.wo, s);
+  kb::moe_select(logits, bias, T, b.idx_n, b.wts_n, b.wn, s);
+}
+
+// moe_select against prefill::moe_topk / moe_route: identical idx, wts and counts; tiles of at most
+// moe_tile_rows(T) pairs of one expert covering every pair once.
+inline bool check_select(Bufs& b, int T) {
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  const size_t P = size_t(T) * TOPK;
+  auto get = [&](const auto* p, size_t n) {
+    std::vector<std::remove_const_t<std::remove_pointer_t<decltype(p)>>> h(n);
+    INGINE_TEST_CUDA(cudaMemcpy(h.data(), p, n * sizeof(h[0]), cudaMemcpyDeviceToHost));
+    return h;
+  };
+  size_t bad = 0;
+  const auto io = get(b.idx_o, P), in = get(b.idx_n, P);
+  const auto wo = get(b.wts_o, P), wn = get(b.wts_n, P);
+  const auto co = get(b.wo.counts, E), cn = get(b.wn.counts, E);
+  for (size_t i = 0; i < P; ++i) bad += io[i] != in[i] || std::memcmp(&wo[i], &wn[i], 4) != 0;
+  for (int e = 0; e < E; ++e) bad += co[e] != cn[e];
+  const int nt = get(b.wn.tiles_n, 1)[0], TR = kb::moe_tile_rows(T);
+  const auto tl = get(b.wn.tiles, size_t(nt));
+  const auto ptok = get(b.wn.pair_token, P), pdst = get(b.wn.pair_dst, P);
+  std::vector<int> seen(P, 0);
+  for (int i = 0; i < nt; ++i) {
+    const int4 t = tl[i];
+    bad += t.z <= 0 || t.z > TR;
+    for (int r = 0; r < t.z; ++r) {
+      const int d = pdst[t.y + r];
+      bad += d / TOPK != ptok[t.y + r] || in[d] != t.x;
+      ++seen[d];
+    }
+  }
+  for (int v : seen) bad += v != 1;
+  std::printf("%s   select: %d tiles, %zu mismatches (idx, wts, counts vs prefill::moe_topk; tile cover)\n",
+              bad ? "FAIL" : "PASS", nt, bad);
+  return bad == 0;
 }
 
 // Old and new chains on the routing of route(): act and down of the new kernels, the new moe_down alone on the
@@ -108,10 +142,10 @@ inline bool compare(Bufs& b, const pk::MoeExperts& ex, const uint16_t* x, int T,
   const size_t P = size_t(T) * TOPK;
   pk::moe_gate_up(ex, bfp(x), T, b.wo, bfp(b.act_o), s);
   pk::moe_down(ex, bfp(b.act_o), T, b.wo, bfp(b.down_o), s);
-  pk::moe_combine(bfp(b.down_o), b.wts, T, bfp(b.out_o), s);
+  pk::moe_combine(bfp(b.down_o), b.wts_o, T, bfp(b.out_o), s);
   kb::moe_gate_up(ex, bfp(x), T, b.wn, bfp(b.act_n), s);
   kb::moe_down(ex, bfp(b.act_n), T, b.wn, bfp(b.down_n), s);
-  pk::moe_combine(bfp(b.down_n), b.wts, T, bfp(b.out_n), s);
+  pk::moe_combine(bfp(b.down_n), b.wts_n, T, bfp(b.out_n), s);
   INGINE_TEST_CUDA(cudaStreamSynchronize(s));
   INGINE_TEST_CUDA(cudaGetLastError());
 

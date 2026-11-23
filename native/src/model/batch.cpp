@@ -409,10 +409,8 @@ std::span<const std::int32_t> BatchDecoder::step(int n, int M, const std::int32_
 
     // ---- routed experts (model._moe_grouped) + post-MLP conv (each slot's state)
     gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
-    CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
-    pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
-    kb::moe_route(idx_, T, work, s);
+    kb::moe_select(router_logits_, f32p(layer.router_bias), T, idx_, wts_, work, s);
     const Experts& ex = layer.experts;
     const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
                             f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};

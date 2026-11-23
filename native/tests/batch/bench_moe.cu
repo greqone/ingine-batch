@@ -146,6 +146,14 @@ int main() {
         most = std::max(most, *std::max_element(counts.begin(), counts.end()));
       }
       const float t_route = time_ms([&](int r) { do_route((*set)[r % nl], T); });
+      // routing alone on the last layer's logits: memset + prefill::moe_topk + moe_route vs moe_select
+      const float* bias = static_cast<const float*>(set->back().router_bias.data);
+      const float r_old = time_ms([&](int) {
+        INGINE_TEST_CUDA(cudaMemsetAsync(b.wo.counts, 0, E * sizeof(int), s));
+        pk::moe_topk(logits, bias, T, b.idx_o, b.wts_o, b.wo.counts, s);
+        pk::moe_route(b.idx_o, T, b.wo, s);
+      });
+      const float r_new = time_ms([&](int) { kb::moe_select(logits, bias, T, b.idx_n, b.wts_n, b.wn, s); });
       auto timed = [&](auto&& body) { return time_ms([&](int r) { do_route((*set)[r % nl], T), body((*set)[r % nl]); }) - t_route; };
       const float o_up = timed([&](const Layer& L) { pk::moe_gate_up(experts(L), bfp(xs[L.idx]), T, b.wo, bfp(b.act_o), s); });
       const float o_all = timed([&](const Layer& L) {
@@ -164,8 +172,9 @@ int main() {
         std::printf("  %s: gate_up %.3f ms + down %.3f ms = %.3f ms | %6.0f GB/s %6.1f TFLOP/s | %3.0f%% of bound\n", who,
                     up, all - up, all, bytes / all / 1e6, flop / all / 1e9, 100.0 * bound_ms / all);
       };
-      std::printf("moe %s T=%3d: %.1f experts (max %d pairs), %.0f MB, bound %.3f ms (%s)\n", nvfp4 ? "nvfp4" : "mxfp8",
-                  T, hit, most, bytes / 1e6, bound_ms, bytes / kPeakBw > flop / kPeakMma ? "memory" : "MMA");
+      std::printf("moe %s T=%3d: %.1f experts (max %d pairs), %.0f MB, bound %.3f ms (%s); routing %.1f -> %.1f us\n",
+                  nvfp4 ? "nvfp4" : "mxfp8", T, hit, most, bytes / 1e6, bound_ms,
+                  bytes / kPeakBw > flop / kPeakMma ? "memory" : "MMA", r_old * 1e3, r_new * 1e3);
       line("old", o_up, o_all);
       line("new", n_up, n_all);
     }
@@ -173,6 +182,7 @@ int main() {
     std::printf("-- %s outputs, T=%d\n", nvfp4 ? "nvfp4" : "mxfp8", maxT);
     const Layer& L = (*set)[0];
     do_route(L, maxT);
+    ok &= check_select(b, maxT);
     ok &= compare(b, experts(L), xs[L.idx], maxT, s);
   }
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
